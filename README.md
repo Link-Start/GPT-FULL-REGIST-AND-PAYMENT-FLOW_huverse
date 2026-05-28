@@ -249,7 +249,7 @@ protocol/gpt_trial_protocol/CONFIGURATION.md
 
 ---
 
-## 单账号全流程
+## 单账号全流程（支持并发和队列，在后面说明）
 
 ### 使用已有邮箱
 
@@ -392,7 +392,7 @@ accfile/pool/full_flow.sqlite3
 
 ### 队列运行
 
-n 并发运行，实际可按资源和浏览器稳定性逐步扩展到 8 并发。2 并发、最多跑 2 个：
+n 并发运行，实际可按资源和浏览器稳定性逐步扩展到 8 并发。
 
 ```bash
 ./run_full_flow_queue_worker.sh \
