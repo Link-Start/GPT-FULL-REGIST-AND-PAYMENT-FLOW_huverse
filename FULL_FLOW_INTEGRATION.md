@@ -38,7 +38,7 @@ Linux fingerprint Firefox from `firefox-fingerprintBrowser/downloads`.
 cd /path/to/GPT-FULL-REGIST-AND-PAYMENT-FLOW
 ./run_trial_payment_full_flow.sh \
   --generate-email \
-  --email-type frimail \
+  --email-type custom \
   --card-line '4111111111111111|03|2030|123' \
   --sms-line '+1xxxxxxxxxx|https://sms-provider.example/api' \
   --dry-run
@@ -50,7 +50,7 @@ cd /path/to/GPT-FULL-REGIST-AND-PAYMENT-FLOW
 cd /path/to/GPT-FULL-REGIST-AND-PAYMENT-FLOW
 ./run_trial_payment_full_flow.sh \
   --generate-email \
-  --email-type frimail \
+  --email-type custom \
   --card-line 'CARD|MM|YYYY|CVV' \
   --sms-line '+1xxxxxxxxxx|https://sms-provider.example/api'
 ```
@@ -63,7 +63,7 @@ To use a specific iCloud mailbox instead of generating one:
 ./run_trial_payment_full_flow.sh \
   --email 'name@icloud.com' \
   --email-type icloud \
-  --email-code-provider agiunx \
+  --email-code-provider extract_json \
   --card-line 'CARD|MM|YYYY|CVV' \
   --sms-line '+1xxxxxxxxxx|https://sms-provider.example/api'
 ```
@@ -81,7 +81,7 @@ Default output format: `cpa`
 ```bash
 ./run_trial_payment_full_flow.sh \
   --generate-email \
-  --email-type frimail \
+  --email-type custom \
   --card-line 'CARD|MM|YYYY|CVV' \
   --sms-line '+1xxxxxxxxxx|https://sms-provider.example/api' \
   --enable-session-json
@@ -119,7 +119,7 @@ with `subprocess` only after both protocol registration and payment succeed:
 ```bash
 ./run_trial_payment_full_flow.sh \
   --generate-email \
-  --email-type frimail \
+  --email-type custom \
   --card-line 'CARD|MM|YYYY|CVV' \
   --sms-line '+1xxxxxxxxxx|https://sms-provider.example/api' \
   --enable-getrt
@@ -221,7 +221,7 @@ Override it when needed:
 ./run_trial_payment_full_flow.sh \
   --protocol-proxy 'http://127.0.0.1:7890' \
   --generate-email \
-  --email-type frimail \
+  --email-type custom \
   --card-line 'CARD|MM|YYYY|CVV' \
   --sms-line '+1xxxxxxxxxx|https://sms-provider.example/api'
 ```
@@ -232,7 +232,7 @@ Run protocol registration without proxy:
 ./run_trial_payment_full_flow.sh \
   --no-protocol-proxy \
   --generate-email \
-  --email-type frimail \
+  --email-type custom \
   --card-line 'CARD|MM|YYYY|CVV' \
   --sms-line '+1xxxxxxxxxx|https://sms-provider.example/api'
 ```
@@ -281,7 +281,7 @@ Equivalent CLI flags:
 ```bash
 ./run_trial_payment_full_flow.sh \
   --generate-email \
-  --email-type frimail \
+  --email-type custom \
   --skip-payment
 ```
 
@@ -566,6 +566,6 @@ UTC_TIME<TAB>EMAIL
 Default txt destinations are split by mailbox type:
 
 ```text
-accfile/pwd/success_accounts.txt    # frimail/default
+accfile/pwd/success_accounts.txt    # custom/default
 accfile/pwd/icsuccess_accounts.txt  # icloud
 ```

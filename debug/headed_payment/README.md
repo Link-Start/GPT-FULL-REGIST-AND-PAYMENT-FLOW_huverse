@@ -40,7 +40,8 @@ cd /opt/openaii
 ./debug/headed_payment/run_headed_payment.sh \
   --email "xxx@icloud.com" \
   --email-type icloud \
-  --email-code-provider agiunx \
+  --email-code-provider extract_json \
+  --email-code-base-url "https://your-email-code.example" \
   --card-line "CARD MM YYYY CVV" \
   --sms-line "+1xxxx----https://sms-api" \
   --enable-session-json \

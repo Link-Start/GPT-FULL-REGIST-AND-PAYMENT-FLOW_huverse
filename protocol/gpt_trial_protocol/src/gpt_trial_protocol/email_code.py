@@ -4,20 +4,20 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+import os
 from typing import Any
 
 import httpx
 
 
-AGIUNX_BASE_URL = "https://agiunx.com"
-FRIMAIL_BASE_URL = "https://api.cudaflowers.edu.kg"
-FRIMAIL_DOMAIN = "cudaflowers.edu.kg"
+DEFAULT_EMAIL_CODE_BASE_URL = os.getenv("GPT_TRIAL_EMAIL_CODE_BASE_URL", "").rstrip("/")
+CUSTOM_EMAIL_DOMAIN = os.getenv("GPT_TRIAL_CUSTOM_EMAIL_DOMAIN", "example-mail.invalid")
 
 
 class EmailCodeProvider(str, Enum):
     AUTO = "auto"
-    AGIUNX = "agiunx"
-    FRIMAIL = "frimail"
+    EXTRACT_JSON = "extract_json"
+    OPENAI_CODE_JSON = "openai_code_json"
 
 
 def utc_now() -> datetime:
@@ -49,7 +49,7 @@ class EmailCodeResult:
     raw: dict[str, Any]
 
     @classmethod
-    def from_agiunx_payload(cls, payload: dict[str, Any]) -> "EmailCodeResult":
+    def from_extract_json_payload(cls, payload: dict[str, Any]) -> "EmailCodeResult":
         latest = payload.get("latest") if isinstance(payload.get("latest"), dict) else {}
         return cls(
             email=str(payload.get("email") or ""),
@@ -59,7 +59,7 @@ class EmailCodeResult:
         )
 
     @classmethod
-    def from_frimail_payload(cls, payload: dict[str, Any]) -> "EmailCodeResult":
+    def from_openai_code_json_payload(cls, payload: dict[str, Any]) -> "EmailCodeResult":
         return cls(
             email=str(payload.get("recipient") or ""),
             latest_code=payload.get("code"),
@@ -100,49 +100,49 @@ class EmailCodeClient:
 
     def extract(self, email: str, *, refresh: bool = False, limit: int = 20) -> EmailCodeResult:
         provider = self._provider_for_email(email)
-        if provider is EmailCodeProvider.FRIMAIL:
-            return self._extract_frimail(email)
-        return self._extract_agiunx(email, refresh=refresh, limit=limit)
+        if provider is EmailCodeProvider.OPENAI_CODE_JSON:
+            return self._extract_openai_code_json(email)
+        return self._extract_extract_json(email, refresh=refresh, limit=limit)
 
-    def _extract_agiunx(self, email: str, *, refresh: bool = False, limit: int = 20) -> EmailCodeResult:
+    def _extract_extract_json(self, email: str, *, refresh: bool = False, limit: int = 20) -> EmailCodeResult:
         params: dict[str, Any] = {"email": email, "limit": limit}
         if refresh:
             params["refresh"] = 1
-        response = self.client.get(f"{self._base_url(EmailCodeProvider.AGIUNX)}/api/v1/extract", params=params)
+        response = self.client.get(f"{self._base_url(EmailCodeProvider.EXTRACT_JSON)}/api/v1/extract", params=params)
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, dict) or not payload.get("ok"):
             raise RuntimeError(f"email code endpoint failed: {payload}")
-        return EmailCodeResult.from_agiunx_payload(payload)
+        return EmailCodeResult.from_extract_json_payload(payload)
 
-    def _extract_frimail(self, email: str) -> EmailCodeResult:
-        response = self.client.get(f"{self._base_url(EmailCodeProvider.FRIMAIL)}/v1/openai-code", params={"recipient": email})
+    def _extract_openai_code_json(self, email: str) -> EmailCodeResult:
+        response = self.client.get(f"{self._base_url(EmailCodeProvider.OPENAI_CODE_JSON)}/v1/openai-code", params={"recipient": email})
         if response.status_code == 404:
             payload = response.json()
             if not isinstance(payload, dict):
                 payload = {"recipient": email, "code": None, "receivedAt": None}
-            return EmailCodeResult.from_frimail_payload(payload)
+            return EmailCodeResult.from_openai_code_json_payload(payload)
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, dict) or not payload.get("code"):
-            raise RuntimeError(f"frimail code endpoint failed: {payload}")
-        return EmailCodeResult.from_frimail_payload(payload)
+            raise RuntimeError(f"openai-code JSON endpoint failed: {payload}")
+        return EmailCodeResult.from_openai_code_json_payload(payload)
 
     def _provider_for_email(self, email: str) -> EmailCodeProvider:
         if self.provider is not EmailCodeProvider.AUTO:
             return self.provider
-        if self.base_url and FRIMAIL_BASE_URL.replace("https://", "") in self.base_url:
-            return EmailCodeProvider.FRIMAIL
-        if email.lower().endswith(f"@{FRIMAIL_DOMAIN}"):
-            return EmailCodeProvider.FRIMAIL
-        return EmailCodeProvider.AGIUNX
+        if email.lower().endswith(f"@{CUSTOM_EMAIL_DOMAIN.lower()}"):
+            return EmailCodeProvider.OPENAI_CODE_JSON
+        return EmailCodeProvider.EXTRACT_JSON
 
     def _base_url(self, provider: EmailCodeProvider) -> str:
-        if self.base_url:
-            return self.base_url
-        if provider is EmailCodeProvider.FRIMAIL:
-            return FRIMAIL_BASE_URL
-        return AGIUNX_BASE_URL
+        base_url = self.base_url or DEFAULT_EMAIL_CODE_BASE_URL
+        if not base_url:
+            raise RuntimeError(
+                "email code base URL is required in the public build; set --email-code-base-url "
+                "or GPT_TRIAL_EMAIL_CODE_BASE_URL for your own provider"
+            )
+        return base_url.rstrip("/")
 
     def wait_for_fresh_code(
         self,

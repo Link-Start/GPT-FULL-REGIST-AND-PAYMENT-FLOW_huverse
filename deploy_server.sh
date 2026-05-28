@@ -60,4 +60,4 @@ fi
 
 echo "[setup] done"
 echo "Run example:"
-echo "./run_trial_payment_full_flow.sh --generate-email --email-type frimail --card-line 'CARD|MM|YYYY|CVV' --sms-line '+1xxx|https://sms-api'"
+echo "./run_trial_payment_full_flow.sh --email 'user@example.com' --email-type auto --email-code-base-url 'https://your-email-code.example' --card-line 'CARD|MM|YYYY|CVV' --sms-line '+1xxx|https://sms-api'"

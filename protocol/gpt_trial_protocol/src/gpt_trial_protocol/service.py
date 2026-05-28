@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .chatgpt import ChatGPTProtocolClient
-from .email_code import AGIUNX_BASE_URL, EmailCodeClient, EmailCodeProvider, FRIMAIL_DOMAIN
+from .email_code import CUSTOM_EMAIL_DOMAIN, DEFAULT_EMAIL_CODE_BASE_URL, EmailCodeClient, EmailCodeProvider
 from .flows import ProtocolRegistrarFlow
 from .http_client import ProtocolHttpClient
 from .models import AccountInput, BrowserProfile, CheckoutInput, ProtocolConfig
@@ -67,17 +67,15 @@ def normalize_email_item(item: EmailItem, *, email_type: str = "auto") -> EmailI
     email = item.email.strip()
     if kind == "auto":
         if "@" not in email:
-            raise ValueError(f"bare email name requires --email-type icloud or --email-type frimail: {email}")
+            raise ValueError(f"bare email name requires --email-type icloud or --email-type custom: {email}")
         return EmailItem(email=email, note_password=item.note_password)
     if kind == "icloud":
         if "@" not in email:
             email = f"{email}@icloud.com"
         return EmailItem(email=email, note_password=item.note_password)
-    if kind == "frimail":
+    if kind == "custom":
         if "@" not in email:
-            email = f"{email}@{FRIMAIL_DOMAIN}"
-        elif not email.lower().endswith(f"@{FRIMAIL_DOMAIN}"):
-            raise ValueError(f"frimail only supports *@{FRIMAIL_DOMAIN}: {email}")
+            email = f"{email}@{CUSTOM_EMAIL_DOMAIN}"
         return EmailItem(email=email, note_password=item.note_password)
     raise ValueError(f"unknown email type: {email_type}")
 
@@ -85,10 +83,10 @@ def normalize_email_item(item: EmailItem, *, email_type: str = "auto") -> EmailI
 def effective_email_code_provider(options: RunOptions, email: str) -> str:
     if options.email_code_provider != EmailCodeProvider.AUTO.value:
         return options.email_code_provider
-    if options.email_type == "frimail" or email.lower().endswith(f"@{FRIMAIL_DOMAIN}"):
-        return EmailCodeProvider.FRIMAIL.value
+    if options.email_type == "custom" or email.lower().endswith(f"@{CUSTOM_EMAIL_DOMAIN.lower()}"):
+        return EmailCodeProvider.OPENAI_CODE_JSON.value
     if options.email_type == "icloud":
-        return EmailCodeProvider.AGIUNX.value
+        return EmailCodeProvider.EXTRACT_JSON.value
     return EmailCodeProvider.AUTO.value
 
 
@@ -104,7 +102,7 @@ def run_one(item: EmailItem, options: RunOptions) -> dict[str, Any]:
     trace_dir = options.trace_dir / sanitize_email(item.email) if options.trace_dir else None
     config = ProtocolConfig(
         timeout=options.timeout,
-        code_receiver_base_url=options.email_code_base_url or AGIUNX_BASE_URL,
+        code_receiver_base_url=options.email_code_base_url or DEFAULT_EMAIL_CODE_BASE_URL,
         trace_dir=trace_dir,
         profile=BrowserProfile(),
     )

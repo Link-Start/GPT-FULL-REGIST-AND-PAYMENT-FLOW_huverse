@@ -23,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--payment-proxy-id", type=int, default=2)
     parser.add_argument("--poll-seconds", type=float, default=5.0)
     parser.add_argument("--email-type", default="icloud")
-    parser.add_argument("--email-code-provider", default="agiunx")
+    parser.add_argument("--email-code-provider", default="auto")
     return parser
 
 

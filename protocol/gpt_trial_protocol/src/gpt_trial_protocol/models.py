@@ -123,7 +123,7 @@ class BrowserProfile:
 class ProtocolConfig:
     chatgpt_base_url: str = "https://chatgpt.com"
     auth_base_url: str = "https://auth.openai.com"
-    code_receiver_base_url: str = "https://agiunx.com"
+    code_receiver_base_url: str = ""
     trace_dir: Path | None = None
     timeout: float = 30.0
     profile: BrowserProfile = field(default_factory=BrowserProfile)

@@ -64,7 +64,7 @@ HTML = r"""<!doctype html>
         <form class="card" id="runForm">
           <h2>启动全流程</h2>
           <div class="row"><label>邮箱</label><input name="email" autocomplete="off" placeholder="name@icloud.com"></div>
-          <div class="split"><div class="row"><label>邮箱类型</label><select name="emailType"><option>icloud</option><option>frimail</option><option>auto</option></select></div><div class="row"><label>验证码来源</label><select name="emailCodeProvider"><option>agiunx</option><option>frimail</option><option>auto</option></select></div></div>
+          <div class="split"><div class="row"><label>邮箱类型</label><select name="emailType"><option>auto</option><option>icloud</option><option>custom</option></select></div><div class="row"><label>验证码来源</label><select name="emailCodeProvider"><option>auto</option><option>extract_json</option><option>openai_code_json</option></select></div></div>
           <div class="row"><label>卡信息</label><input name="cardLine" autocomplete="off" placeholder="CARD MM/YY CVV"></div>
           <div class="row"><label>支付接码</label><input name="smsLine" autocomplete="off" placeholder="+1xxxx----https://sms-api"></div>
           <div class="split"><div class="row"><label>支付代理模式</label><select name="paymentMode"><option value="auto_temp">直连，t=bv 后用代理</option><option value="direct">只用直连</option><option value="force_proxy">支付开始就用代理</option></select></div><div class="row"><label>代理 ID</label><input name="paymentProxyId" type="number" min="0" placeholder="可选"></div></div>
@@ -465,7 +465,7 @@ class FlowWebHandler(BaseHTTPRequestHandler):
 
     def _append_common_flow_args(self, cmd: list[str], body: dict[str, Any]) -> None:
         cmd.extend(["--email-type", str(body.get("emailType") or "icloud")])
-        cmd.extend(["--email-code-provider", str(body.get("emailCodeProvider") or "agiunx")])
+        cmd.extend(["--email-code-provider", str(body.get("emailCodeProvider") or "auto")])
         mode = str(body.get("paymentMode") or "auto_temp")
         proxy_id = self._int(body.get("paymentProxyId"), 0)
         proxy_value = self.proxies.get_value(proxy_id) if proxy_id > 0 else ""

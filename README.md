@@ -248,6 +248,26 @@ protocol/gpt_trial_protocol/CONFIGURATION.md
 
 正常全流程运行时，不需要手动启动协议机；编排器会通过 CLI/subprocess 调用它。
 
+公开版不内置任何私有邮箱验证码接口，也不会默认请求任何作者自用服务。开发者必须配置自己的邮箱验证码服务：
+
+```bash
+GPT_TRIAL_EMAIL_CODE_BASE_URL=https://your-email-code.example
+GPT_TRIAL_EMAIL_CODE_PROVIDER=auto
+GPT_TRIAL_CUSTOM_EMAIL_DOMAIN=example-mail.invalid
+```
+
+当前内置的是两种通用 JSON 适配形态：
+
+```text
+extract_json:
+  GET <base>/api/v1/extract?email=...&refresh=1&limit=20
+  response: {"ok": true, "email": "...", "latestCode": "123456", "latest": {"date": "..."}}
+
+openai_code_json:
+  GET <base>/v1/openai-code?recipient=...
+  response: {"recipient": "...", "code": "123456", "receivedAt": "..."}
+```
+
 ---
 
 ## 单账号全流程（支持并发和队列，在后面说明）
@@ -258,7 +278,8 @@ protocol/gpt_trial_protocol/CONFIGURATION.md
 ./run_trial_payment_full_flow.sh \
   --email "user@example.com" \
   --email-type "icloud" \
-  --email-code-provider "agiunx" \
+  --email-code-provider "extract_json" \
+  --email-code-base-url "https://your-email-code.example" \
   --card-line "4111 1111 1111 1111 02/30 123" \
   --sms-line "+1xxxxxxxxxx----https://sms-api.example/path"
 ```
@@ -268,8 +289,9 @@ protocol/gpt_trial_protocol/CONFIGURATION.md
 ```bash
 ./run_trial_payment_full_flow.sh \
   --generate-email \
-  --email-type "frimail" \
-  --email-code-provider "frimail" \
+  --email-type "custom" \
+  --email-code-provider "openai_code_json" \
+  --email-code-base-url "https://your-email-code.example" \
   --card-line "4111 1111 1111 1111 02/30 123" \
   --sms-line "+1xxxxxxxxxx----https://sms-api.example/path"
 ```
@@ -280,7 +302,8 @@ protocol/gpt_trial_protocol/CONFIGURATION.md
 ./run_trial_payment_full_flow.sh \
   --email "user@example.com" \
   --email-type "icloud" \
-  --email-code-provider "agiunx" \
+  --email-code-provider "extract_json" \
+  --email-code-base-url "https://your-email-code.example" \
   --card-line "4111 1111 1111 1111 02/30 123" \
   --sms-line "+1xxxxxxxxxx----https://sms-api.example/path" \
   --enable-session-json \
@@ -293,7 +316,8 @@ protocol/gpt_trial_protocol/CONFIGURATION.md
 ./run_trial_payment_full_flow.sh \
   --email "user@example.com" \
   --email-type "icloud" \
-  --email-code-provider "agiunx" \
+  --email-code-provider "extract_json" \
+  --email-code-base-url "https://your-email-code.example" \
   --card-line "4111 1111 1111 1111 02/30 123" \
   --sms-line "+1xxxxxxxxxx----https://sms-api.example/path" \
   --enable-getrt \
@@ -306,7 +330,8 @@ OAuth 需要补手机号时：
 ./run_trial_payment_full_flow.sh \
   --email "user@example.com" \
   --email-type "icloud" \
-  --email-code-provider "agiunx" \
+  --email-code-provider "extract_json" \
+  --email-code-base-url "https://your-email-code.example" \
   --card-line "4111 1111 1111 1111 02/30 123" \
   --sms-line "+1xxxxxxxxxx----https://payment-sms-api.example/path" \
   --enable-getrt \
@@ -573,7 +598,8 @@ SSHPASS='your-ssh-password' ./debug/headed_payment/connect_local.sh
 ./debug/headed_payment/run_headed_payment.sh \
   --email "user@example.com" \
   --email-type icloud \
-  --email-code-provider agiunx \
+  --email-code-provider extract_json \
+  --email-code-base-url "https://your-email-code.example" \
   --card-line "4111 1111 1111 1111 02/30 123" \
   --sms-line "+1xxxxxxxxxx----https://sms-api.example/path"
 ```
@@ -707,7 +733,8 @@ ruyipage/.env
 ./run_trial_payment_full_flow.sh \
   --email "user@example.com" \
   --email-type "icloud" \
-  --email-code-provider "agiunx" \
+  --email-code-provider "extract_json" \
+  --email-code-base-url "https://your-email-code.example" \
   --card-line "4111 1111 1111 1111 02/30 123" \
   --sms-line "+1xxxxxxxxxx----https://sms-api.example/path"
 ```

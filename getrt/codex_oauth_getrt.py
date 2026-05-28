@@ -348,7 +348,7 @@ def email_code_snapshot(code_client: Any, email: str) -> dict[str, Any]:
 
 def import_protocol_modules() -> dict[str, Any]:
     from gpt_trial_protocol.chatgpt import ChatGPTProtocolClient
-    from gpt_trial_protocol.email_code import AGIUNX_BASE_URL, EmailCodeClient, EmailCodeProvider
+    from gpt_trial_protocol.email_code import DEFAULT_EMAIL_CODE_BASE_URL, EmailCodeClient, EmailCodeProvider
     from gpt_trial_protocol.flows import ProtocolRegistrarFlow
     from gpt_trial_protocol.http_client import ProtocolHttpClient, json_or_empty, require_ok
     from gpt_trial_protocol.models import BrowserProfile, ProtocolConfig
@@ -363,7 +363,7 @@ def import_protocol_modules() -> dict[str, Any]:
     sentinel_http.DEFAULT_FLOW_BY_PURPOSE.setdefault("authorize_continue", "authorize_continue")
 
     return {
-        "AGIUNX_BASE_URL": AGIUNX_BASE_URL,
+        "DEFAULT_EMAIL_CODE_BASE_URL": DEFAULT_EMAIL_CODE_BASE_URL,
         "BrowserProfile": BrowserProfile,
         "ChatGPTProtocolClient": ChatGPTProtocolClient,
         "EmailCodeClient": EmailCodeClient,
@@ -1133,9 +1133,9 @@ def build_no_refresh_output(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Protocol-first Codex OAuth refresh-token exporter.")
-    parser.add_argument("--email", required=True, help="Existing OpenAI account email or local-part when --email-type is frimail/icloud.")
-    parser.add_argument("--email-type", choices=["auto", "icloud", "frimail"], default="auto")
-    parser.add_argument("--email-code-provider", choices=["auto", "agiunx", "frimail"], default="auto")
+    parser.add_argument("--email", required=True, help="Existing OpenAI account email or local-part when --email-type is custom/icloud.")
+    parser.add_argument("--email-type", choices=["auto", "icloud", "custom"], default="auto")
+    parser.add_argument("--email-code-provider", choices=["auto", "extract_json", "openai_code_json"], default="auto")
     parser.add_argument("--email-code-base-url")
     parser.add_argument("--proxy", default=os.environ.get("GPT_TRIAL_PROXY") or "http://127.0.0.1:7897")
     parser.add_argument("--no-proxy", action="store_true")
@@ -1188,7 +1188,7 @@ def main() -> int:
 
     config = modules["ProtocolConfig"](
         timeout=args.timeout,
-        code_receiver_base_url=args.email_code_base_url or modules["AGIUNX_BASE_URL"],
+        code_receiver_base_url=args.email_code_base_url or modules["DEFAULT_EMAIL_CODE_BASE_URL"],
         trace_dir=trace_dir,
         profile=modules["BrowserProfile"](),
     )

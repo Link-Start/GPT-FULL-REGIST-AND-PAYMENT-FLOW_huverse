@@ -1571,8 +1571,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--generate-email", action="store_true")
     parser.add_argument("--generated-email-prefix", default="lu")
     parser.add_argument("--login-existing", action="store_true")
-    parser.add_argument("--email-type", choices=["auto", "icloud", "frimail"], default="frimail")
-    parser.add_argument("--email-code-provider", choices=["auto", "agiunx", "frimail"], default="auto")
+    parser.add_argument("--email-type", choices=["auto", "icloud", "custom"], default="custom")
+    parser.add_argument("--email-code-provider", choices=["auto", "extract_json", "openai_code_json"], default="auto")
     parser.add_argument("--email-code-base-url", default="")
     parser.add_argument("--checkout-country", default="US")
     parser.add_argument("--checkout-currency", default="USD")
@@ -1627,7 +1627,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--success-account-file",
         default=os.environ.get("SUCCESS_ACCOUNT_FILE", ""),
-        help="Override success-account txt. Default: frimail -> success_accounts.txt, icloud -> icsuccess_accounts.txt.",
+        help="Override success-account txt. Default: custom -> success_accounts.txt, icloud -> icsuccess_accounts.txt.",
     )
     parser.add_argument("--payment-extra-arg", action="append", default=[])
     parser.add_argument(
@@ -1668,8 +1668,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-getrt-proxy", action="store_true")
     parser.add_argument("--getrt-proxy-chain-upstream", default=os.environ.get("GETRT_PROXY_CHAIN_UPSTREAM", os.environ.get("PROTOCOL_PROXY_CHAIN_UPSTREAM", "")))
     parser.add_argument("--getrt-proxy-chain-via", default=os.environ.get("GETRT_PROXY_CHAIN_VIA", os.environ.get("PROTOCOL_PROXY_CHAIN_VIA", "http://127.0.0.1:7897")))
-    parser.add_argument("--getrt-email-type", choices=["", "auto", "icloud", "frimail"], default="", help="Default: --email-type.")
-    parser.add_argument("--getrt-email-code-provider", choices=["", "auto", "agiunx", "frimail"], default="", help="Default: --email-code-provider.")
+    parser.add_argument("--getrt-email-type", choices=["", "auto", "icloud", "custom"], default="", help="Default: --email-type.")
+    parser.add_argument("--getrt-email-code-provider", choices=["", "auto", "extract_json", "openai_code_json"], default="", help="Default: --email-code-provider.")
     parser.add_argument("--getrt-email-code-base-url", default="", help="Default: --email-code-base-url.")
     parser.add_argument("--getrt-timeout", type=float, default=30.0)
     parser.add_argument("--getrt-code-timeout", type=float, default=90.0)

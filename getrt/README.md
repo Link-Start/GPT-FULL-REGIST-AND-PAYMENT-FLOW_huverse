@@ -19,10 +19,12 @@ OpenAI 邮箱登录协议
 cd /path/to/GPT-FULL-REGIST-AND-PAYMENT-FLOW
 
 python3 getrt/codex_oauth_getrt.py \
-  --email 'name@cudaflowers.edu.kg' \
-  --email-type frimail \
+  --email 'user@example.com' \
+  --email-type auto \
+  --email-code-provider extract_json \
+  --email-code-base-url 'https://your-email-code.example' \
   --proxy 'http://127.0.0.1:7897' \
-  --out getrt/runtime/name_codex_oauth.json
+  --out getrt/runtime/user_codex_oauth.json
 ```
 
 默认输出 CPA/CLIProxyAPI JSON。可选输出格式：
@@ -44,8 +46,10 @@ python3 getrt/codex_oauth_getrt.py \
 
 ```bash
 python3 getrt/codex_oauth_getrt.py \
-  --email 'name@cudaflowers.edu.kg' \
-  --email-type frimail \
+  --email 'user@example.com' \
+  --email-type auto \
+  --email-code-provider extract_json \
+  --email-code-base-url 'https://your-email-code.example' \
   --probe-only
 ```
 
