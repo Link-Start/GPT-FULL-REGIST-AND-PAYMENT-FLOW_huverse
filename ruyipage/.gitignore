@@ -1,0 +1,35 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Packaging outputs
+build/
+dist/
+*.egg-info/
+ruyiPage.egg-info/
+
+# Temp fingerprint profiles
+userdir_*/
+
+# Local tool cache
+.ruff_cache/
+.pytest_cache/
+
+# Generated example outputs
+examples/output/
+
+# Local private checkout inputs
+.env
+card_info.json
+runtime_*.json
+profiles/
+recordings/
+fingerprints/
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/

@@ -1,0 +1,44 @@
+# Local secrets and operator configuration
+.env
+full_flow.env
+*.local
+
+# Runtime output
+runtime/
+accfile/
+getrt/runtime/
+**/runtime/
+**/recordings/
+**/profiles/
+**/fingerprints/
+**/userdir_*/
+**/downloads/runtime/
+
+# Private payment inputs
+**/card_info.json
+**/runtime_*.json
+
+# Python/build/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
+ruyiPage.egg-info/
+.venv/
+venv/
+
+# IDE/OS
+.idea/
+.vscode/
+.DS_Store
+
+# Legacy workspace not required for full-flow deployment
+NULLCARD/
+
+# Extracted fingerprint browser is rebuilt from downloads/*.tar.xz on server
+firefox-fingerprintBrowser/browser/
+firefox-fingerprintBrowser/downloads/*.tar.xz
