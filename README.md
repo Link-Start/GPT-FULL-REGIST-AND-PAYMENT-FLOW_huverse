@@ -19,7 +19,7 @@
 
 ---
 
-## 项目定位
+## 项目定位（可用于日区Paypal，自行二次开发，已确认可行）
 （Paypal渠道拉闸，本注册机目前能全流程成功，但是OpenAI疑似会延迟检测PP状态，而目前的PP渠道所注册的PP会秒封，所以本项目目前已没有产号价值，可用于学习研究）
 
 `GPT-FULL-REGIST AND PAYMENT-FLOW` 是一个完整的、可部署的全流程自动化项目（全协议注册+无头支付+协议Oauth）。它把 GPT 账号协议注册、OpenAI hosted checkout 获取、Stripe/PayPal 支付、成功账号归档、可选 session-json 导出、可选 Codex OAuth getrt 导出串成一条可观测、可并发、可 Web 管理的流水线。
