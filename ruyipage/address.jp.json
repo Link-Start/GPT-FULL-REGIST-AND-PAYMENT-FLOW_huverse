@@ -1,0 +1,27 @@
+{
+  "personalInfo": {
+    "firstName": "太郎",
+    "lastName": "田中",
+    "firstNameKana": "タロウ",
+    "lastNameKana": "タナカ",
+    "firstNameKanji": "太郎",
+    "lastNameKanji": "田中"
+  },
+  "contact": {
+    "email": "placeholder@example.com",
+    "phone": ""
+  },
+  "address": {
+    "street": "西神楽一線十七号",
+    "line2": "グリーンヒル203",
+    "building": "グリーンヒル203",
+    "city": "旭川市",
+    "state": "北海道",
+    "stateCode": "JP-01",
+    "zipCode": "0788381",
+    "country": "JP"
+  },
+  "additional": {
+    "password": "ACxR9vPz4mNwK7s!"
+  }
+}

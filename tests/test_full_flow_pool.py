@@ -216,12 +216,12 @@ def test_retry_email_exposes_last_reason_for_targeted_resource_rotation(tmp_path
 
 
 def test_randomize_proxy_session_rotates_sid_token():
-    value = "us2.cliproxy.io:3010:user-region-US-sid-HfQtVsaJ-t-5:pass"
+    value = "proxy.example.net:1080:user-region-US-sid-HfQtVsaJ-t-5:pass"
     rotated, changed = randomize_proxy_session(value)
     assert changed is True
     assert rotated != value
     assert "-sid-HfQtVsaJ-t-" not in rotated
-    assert rotated.startswith("us2.cliproxy.io:3010:user-region-US-sid-")
+    assert rotated.startswith("proxy.example.net:1080:user-region-US-sid-")
     assert rotated.endswith("-t-5:pass")
 
     unchanged, changed = randomize_proxy_session("host:2000:user:pass")

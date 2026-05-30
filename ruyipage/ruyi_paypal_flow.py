@@ -43,12 +43,27 @@ DEFAULT_FIREFOX_PATH = str(
 SYSTEM_PROXY_MARKERS = {"", "system", "system://", "win", "windows", "os"}
 DIRECT_PROXY_MARKERS = {"direct", "none", "off", "no", "false"}
 SMS_CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+LUBAN_SMS_BASE_URL = "https://lubansms.com/v2/api"
+LUBAN_JP_PAYPAL_SERVICE_ID = "729637"
 
 
 class FlowFailed(RuntimeError):
     def __init__(self, result: dict[str, Any]) -> None:
         super().__init__(str(result.get("reason") or "flow_failed"))
         self.result = result
+
+
+def classify_unhandled_failure(exc: BaseException) -> str:
+    text = str(exc)
+    if re.search(r"LubanSMS getNumber failed", text, re.I):
+        if re.search(r"NO_NUMBER", text, re.I):
+            return "sms_provider_no_number"
+        if re.search(r"balance|余额|insufficient", text, re.I):
+            return "sms_provider_balance_low"
+        return "sms_provider_error"
+    if re.search(r"LubanSMS getSms failed", text, re.I):
+        return "sms_provider_error"
+    return "unexpected_exception"
 
 
 def linux_profile_root() -> Path:
@@ -195,6 +210,26 @@ def random_letters(length: int) -> str:
     return "".join(random.choice(string.ascii_lowercase) for _ in range(length)).capitalize()
 
 
+def address_country(address: dict[str, Any]) -> str:
+    return str(address.get("country") or address.get("countryCode") or "").strip().upper()
+
+
+def is_japan_address(address: dict[str, Any]) -> bool:
+    return address_country(address) in {"JP", "JPN", "JAPAN", "日本"}
+
+
+def paypal_phone_for_country(phone: str, country: str) -> str:
+    digits = re.sub(r"\D+", "", phone)
+    if country.upper() in {"JP", "JPN", "JAPAN"}:
+        # PayPal Japan renders a +81 country selector; the field expects the
+        # national significant number without the +81 prefix.
+        if digits.startswith("81") and len(digits) >= 11:
+            return digits[2:]
+        if digits.startswith("0") and len(digits) >= 10:
+            return digits[1:]
+    return digits[-10:]
+
+
 def parse_window_size(value: str, default: tuple[int, int] = (1280, 900)) -> tuple[int, int]:
     text = (value or "").strip().lower()
     if not text:
@@ -207,10 +242,87 @@ def parse_window_size(value: str, default: tuple[int, int] = (1280, 900)) -> tup
     return width, height
 
 
+def http_get_json(url: str, *, timeout: int = 25) -> dict[str, Any]:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+            "Accept": "application/json,text/plain,*/*",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"unexpected JSON response: {payload!r}")
+    return payload
+
+
+def build_luban_api_url(path: str, params: dict[str, str]) -> str:
+    return f"{LUBAN_SMS_BASE_URL}/{path}?" + urllib.parse.urlencode(params)
+
+
+def _float_option(value: str, default: float) -> float:
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def acquire_luban_sms_number(spec: str) -> tuple[str, str]:
+    """Acquire a LubanSMS number and return (phone, poll_api_url).
+
+    Supported line:
+      luban://jp-paypal?apikey=...               # uses the cheapest observed JP PayPal service
+      luban://jp-paypal?apikey=...&service_id=...
+      luban://jp-paypal?apikey=...&number_retries=10
+    """
+    parsed = urllib.parse.urlparse(spec)
+    query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+    apikey = query.get("apikey") or os.environ.get("LUBAN_SMS_APIKEY", "").strip()
+    service_id = query.get("service_id") or os.environ.get("LUBAN_SMS_SERVICE_ID", "").strip() or LUBAN_JP_PAYPAL_SERVICE_ID
+    if not apikey:
+        raise ValueError("LubanSMS requires apikey query parameter or LUBAN_SMS_APIKEY")
+    try:
+        number_retries = int(str(query.get("number_retries") or os.environ.get("LUBAN_SMS_NUMBER_RETRIES", "10")).strip())
+    except (TypeError, ValueError):
+        number_retries = 10
+    number_retries = max(0, number_retries)
+    number_interval = _float_option(
+        query.get("number_interval") or os.environ.get("LUBAN_SMS_NUMBER_INTERVAL", "1"),
+        1.0,
+    )
+    if number_interval <= 0:
+        number_interval = 1.0
+    payload: dict[str, Any] = {}
+    for attempt in range(1, number_retries + 2):
+        payload = http_get_json(build_luban_api_url("getNumber", {"apikey": apikey, "service_id": service_id}))
+        if str(payload.get("code")) == "0":
+            break
+        msg = str(payload.get("msg") or payload.get("message") or "")
+        if not re.search(r"NO_NUMBER", msg, re.I):
+            raise RuntimeError(f"LubanSMS getNumber failed: {payload}")
+        if attempt > number_retries:
+            raise RuntimeError(f"LubanSMS getNumber failed after {attempt} NO_NUMBER attempts: {payload}")
+        log(f"[sms] LubanSMS no JP PayPal number yet; retrying in {number_interval:g}s attempt={attempt}")
+        time.sleep(number_interval)
+    number = re.sub(r"\D+", "", str(payload.get("number") or ""))
+    request_id = str(payload.get("request_id") or "").strip()
+    if not number or not request_id:
+        raise RuntimeError(f"LubanSMS getNumber missing number/request_id: {payload}")
+    log(f"[sms] LubanSMS acquired JP PayPal number request_id={request_id} phone=***{number[-4:]}")
+    poll_url = "luban://poll?" + urllib.parse.urlencode({"apikey": apikey, "request_id": request_id})
+    return number, poll_url
+
+
 def parse_sms_line(value: str) -> tuple[str, str]:
-    if "|" not in value:
+    text = str(value or "").strip()
+    if text.startswith("luban://"):
+        return acquire_luban_sms_number(text)
+    if "|" not in text:
         raise ValueError("sms-line must be PHONE|API_URL")
-    phone, url = value.split("|", 1)
+    phone, url = text.split("|", 1)
     phone = re.sub(r"\D+", "", phone)
     if not phone or not url.strip():
         raise ValueError("sms-line must contain phone and api url")
@@ -689,6 +801,22 @@ def find_free_port(start: int = 24000, end: int = 32000) -> int:
 def fetch_sms_code(api_url: str) -> tuple[str, str, str]:
     if api_url.startswith("manual://"):
         return "", "manual://", ""
+    if api_url.startswith("luban://"):
+        params = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(api_url).query, keep_blank_values=True))
+        apikey = params.get("apikey") or os.environ.get("LUBAN_SMS_APIKEY", "").strip()
+        request_id = params.get("request_id", "").strip()
+        if not apikey or not request_id:
+            raise ValueError("LubanSMS poll URL requires apikey and request_id")
+        payload = http_get_json(build_luban_api_url("getSms", {"apikey": apikey, "request_id": request_id}), timeout=20)
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if str(payload.get("code")) == "0" and payload.get("msg") == "success":
+            code = str(payload.get("sms_code") or extract_sms_code(raw))
+            return code, f"{code}|{raw}", raw
+        if str(payload.get("code")) == "0" and payload.get("msg") == "wait":
+            return "", raw, raw
+        if payload.get("msg") == "wrong_status":
+            return "", raw, raw
+        raise RuntimeError(f"LubanSMS getSms failed: {payload}")
     if api_url.startswith("http://a.62-us.com/"):
         api_url = "https://" + api_url[len("http://") :]
     req = urllib.request.Request(
@@ -730,7 +858,12 @@ def extract_sms_code(raw: str) -> str:
     candidates: list[str] = []
     text = str(raw or "")
     try:
-        candidates.extend(_json_strings(json.loads(text)))
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            for key in ("sms_code", "code", "otp"):
+                if payload.get(key):
+                    candidates.append(str(payload.get(key)))
+        candidates.extend(_json_strings(payload))
     except Exception:
         pass
     parts = [part.strip() for part in text.strip().split("|")]
@@ -1129,7 +1262,12 @@ class RuyiPayPalFlow:
                     snapshot_dir=str(ROOT / "recordings" / "ruyi_snapshots"),
                     marionette=not self.args.disable_marionette,
                 )
-                opts.set_pref("intl.accept_languages", "en-US,en")
+                locale = (self.args.locale or "en-US").strip()
+                if locale.lower().startswith("ja"):
+                    accept_languages = "ja-JP,ja,en-US,en"
+                else:
+                    accept_languages = "en-US,en"
+                opts.set_pref("intl.accept_languages", accept_languages)
                 opts.set_pref("privacy.resistFingerprinting", False)
                 apply_standard_tracking_protection(opts)
                 if self.proxy and self.proxy["scheme"].startswith("socks"):
@@ -1174,7 +1312,7 @@ class RuyiPayPalFlow:
             self.fp_context.apply_emulation(self.page, logger=log)
         else:
             try:
-                self.page.emulation.set_locale("en-US")
+                self.page.emulation.set_locale((self.args.locale or "en-US").strip() or "en-US")
                 self.page.emulation.set_timezone(self.args.timezone)
             except Exception as exc:
                 log(f"[ruyi] locale/timezone emulation skipped: {exc}")
@@ -1336,19 +1474,23 @@ class RuyiPayPalFlow:
             timeout=5,
         ) or {}
 
-    def inject_common_checkout_styles(self) -> None:
+    def inject_common_checkout_styles(self, *, include_datadome: bool = False) -> None:
         if not self.page:
             return
+        include_datadome_js = "true" if include_datadome else "false"
         try:
             self.js(
                 r"""
 (() => {
   const id = 'ruyipage-common-checkout-styles';
-  const css = [
-    '#captcha-standalone,.captcha-overlay,.captcha-container,.AddressAutocomplete-results',
-    'iframe[src*="geo.ddc.paypal.com"],iframe[src*="ddc.paypal.com"],iframe[src*="datadome"],iframe[src*="captcha-delivery"]',
-    '[src*="geo.ddc.paypal.com"],[src*="ddc.paypal.com"],[src*="datadome"],[src*="captcha-delivery"]'
-  ].join(',') + '{display:none!important;height:0!important;min-height:0!important;max-height:0!important;width:0!important;min-width:0!important;max-width:0!important;overflow:hidden!important;opacity:0!important;pointer-events:none!important;visibility:hidden!important}';
+  const selectors = ['.AddressAutocomplete-results'];
+  if (__INCLUDE_DATADOME__) {
+    selectors.push(
+      'iframe[src*="geo.ddc.paypal.com"],iframe[src*="ddc.paypal.com"],iframe[src*="datadome"],iframe[src*="captcha-delivery"]',
+      '[src*="geo.ddc.paypal.com"],[src*="ddc.paypal.com"],[src*="datadome"],[src*="captcha-delivery"]'
+    );
+  }
+  const css = selectors.join(',') + '{display:none!important;height:0!important;min-height:0!important;max-height:0!important;width:0!important;min-width:0!important;max-width:0!important;overflow:hidden!important;opacity:0!important;pointer-events:none!important;visibility:hidden!important}';
   let st = document.getElementById(id);
   if (!st) {
     st = document.createElement('style');
@@ -1360,7 +1502,7 @@ class RuyiPayPalFlow:
   }
   return true;
 })()
-""",
+""".replace("__INCLUDE_DATADOME__", include_datadome_js),
                 timeout=2,
             )
         except Exception as exc:
@@ -1372,7 +1514,7 @@ class RuyiPayPalFlow:
             before_url = str((self.page_info() or {}).get("url") or "")
         except Exception:
             before_url = ""
-        self.inject_common_checkout_styles()
+        self.inject_common_checkout_styles(include_datadome=True)
         deadline = time.time() + 2.0
         while time.time() < deadline:
             time.sleep(0.35)
@@ -1946,6 +2088,9 @@ class RuyiPayPalFlow:
     def select_state(self, value: str) -> None:
         if not self.page:
             return
+        candidates = [str(value or "").strip()]
+        if candidates[0] in {"北海道", "Hokkaido", "JP-01"}:
+            candidates = ["北海道", "Hokkaido", "JP-01"]
         selectors = [
             "select[name='state']",
             "select#state",
@@ -1955,24 +2100,78 @@ class RuyiPayPalFlow:
             "#billingAdministrativeArea",
             "select[name='billingAdministrativeArea']",
         ]
+        result = self.js(
+            f"""
+(() => {{
+  function visible(el) {{
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && !el.disabled && style.visibility !== 'hidden' && style.display !== 'none';
+  }}
+  const selectors = {json.dumps(selectors)};
+  const candidates = {json.dumps(candidates)};
+  for (const selector of selectors) {{
+    const el = document.querySelector(selector);
+    if (!visible(el)) continue;
+    const options = [...(el.options || [])];
+    let found = null;
+    for (const candidate of candidates) {{
+      const wanted = String(candidate || '').trim().toLowerCase();
+      found = options.find((opt) => {{
+        const value = String(opt.value || '').trim().toLowerCase();
+        const text = String(opt.textContent || '').trim().toLowerCase();
+        return value === wanted || text === wanted || text.includes(wanted);
+      }});
+      if (found) break;
+    }}
+    if (!found) return {{ok:false, selector, reason:'state_option_not_found', candidates, options: options.map((o) => ({{value:o.value, text:o.textContent}})).slice(0, 80)}};
+    el.value = found.value;
+    el.dispatchEvent(new Event('input', {{bubbles:true}}));
+    el.dispatchEvent(new Event('change', {{bubbles:true}}));
+    el.dispatchEvent(new Event('blur', {{bubbles:true}}));
+    return {{ok:true, selector, value:found.value, text:found.textContent}};
+  }}
+  return {{ok:false, reason:'state_select_not_found'}};
+}})()
+""",
+            timeout=3,
+        )
+        if isinstance(result, dict) and result.get("ok"):
+            return
+        if isinstance(result, dict) and result:
+            log(f"[address] state select fallback needed: {result}")
         selector = self.visible_selector(selectors)
         if selector:
             ele = self.page.ele("css:" + selector, timeout=1)
             if ele:
-                try:
-                    ele.select.by_value(value)
-                    return
-                except Exception:
-                    pass
+                for candidate in candidates:
+                    try:
+                        ele.select.by_value(candidate)
+                        return
+                    except Exception:
+                        pass
         self.js(
             f"""
 (() => {{
   const selectors = {json.dumps(selectors)};
-  const value = {json.dumps(value)};
+  const candidates = {json.dumps(candidates)};
   for (const selector of selectors) {{
     const el = document.querySelector(selector);
     if (!el) continue;
-    el.value = value;
+    let selected = '';
+    const options = [...(el.options || [])];
+    for (const candidate of candidates) {{
+      const found = options.find((opt) =>
+        String(opt.value || '').trim().toLowerCase() === String(candidate).trim().toLowerCase() ||
+        String(opt.textContent || '').trim().toLowerCase() === String(candidate).trim().toLowerCase()
+      );
+      if (found) {{
+        selected = found.value;
+        break;
+      }}
+    }}
+    el.value = selected || candidates[0] || '';
     el.dispatchEvent(new Event('input', {{bubbles:true}}));
     el.dispatchEvent(new Event('change', {{bubbles:true}}));
     return true;
@@ -2042,10 +2241,39 @@ class RuyiPayPalFlow:
             if latest:
                 log(f"[stripe] amount text: {' | '.join(latest[:4])}")
                 if not any(is_zero_amount_text(x) for x in latest):
+                    deferred = self.stripe_deferred_coupon_amount_state()
+                    if deferred.get("ok"):
+                        log(f"[stripe] accepted deferred coupon recurring amount: {deferred}")
+                        return
                     raise RuntimeError(f"Stripe amount check failed; expected 0 amount: {latest[:4]}")
                 return
             time.sleep(1)
         raise RuntimeError("Stripe amount check failed: amount text not found")
+
+    def stripe_deferred_coupon_amount_state(self) -> dict[str, Any]:
+        """Japanese Stripe may show only the post-coupon recurring fee, not today's 0 due."""
+        try:
+            state = self.js(
+                r"""
+(() => {
+  const text = (document.body && document.body.innerText || '').replace(/\s+/g, ' ').trim();
+  const total = String(document.querySelector('[data-testid="product-summary-total-amount"], #ProductSummary-totalAmount')?.innerText || '').trim();
+  const description = String(document.querySelector('[data-testid="product-summary-subscription-description"], #ProductSummary-description')?.innerText || '').trim();
+  const hasDeferredCoupon =
+    /クーポン失効後/.test(text) ||
+    /after\s+(the\s+)?coupon\s+(expires|expiration)/i.test(text) ||
+    /after\s+your\s+(trial|promotion)/i.test(text);
+  const hasImmediateCharge =
+    /(本日|今日|now|today|due now|支払額|請求額|本日の請求)/i.test(text) &&
+    /[$¥€£]\s*[1-9][\d,.]*/.test(text);
+  return {ok: Boolean(hasDeferredCoupon && !hasImmediateCharge), total, description, hasDeferredCoupon, hasImmediateCharge};
+})()
+""",
+                timeout=3,
+            )
+            return state if isinstance(state, dict) else {}
+        except Exception:
+            return {}
 
     def select_stripe_address_autocomplete(self) -> bool:
         point = self.js(
@@ -2383,6 +2611,12 @@ class RuyiPayPalFlow:
     def fill_stripe_billing_address(self, address: dict[str, Any]) -> None:
         personal = self.profile.get("personalInfo") or {}
         full_name = f"{personal.get('firstName', '')} {personal.get('lastName', '')}".strip()
+        japan_address = is_japan_address(address)
+        if japan_address:
+            self.ensure_stripe_country(address)
+            seed = str(address["street"])
+        else:
+            seed = self.address_lookup_seed(address)
         line1 = [
             "#billingAddressLine1",
             "input[name='billingAddressLine1']",
@@ -2394,37 +2628,105 @@ class RuyiPayPalFlow:
             "input[aria-label*='address' i]",
             "input[aria-label*='住所']",
         ]
-        if not self.type_field(line1, self.address_lookup_seed(address), timeout=2, fast=True):
-            self.fill_stripe_line1_dom(self.address_lookup_seed(address))
+        if not self.type_field(line1, seed, timeout=2, fast=True):
+            self.fill_stripe_line1_dom(seed)
         time.sleep(random.uniform(0.12, 0.2))
-        address_autofilled = self.select_stripe_address_autocomplete()
+        address_autofilled = False if japan_address else self.select_stripe_address_autocomplete()
         if not address_autofilled:
-            self.press_key("ArrowDown")
-            time.sleep(0.15)
-            self.press_key("Enter")
-            time.sleep(random.uniform(0.2, 0.35))
+            if not japan_address:
+                self.press_key("ArrowDown")
+                time.sleep(0.15)
+                self.press_key("Enter")
+                time.sleep(random.uniform(0.2, 0.35))
         if len(self.field_value(line1).strip()) < 5:
             if not self.type_field(line1, address["street"], timeout=1, fast=True):
                 self.fill_stripe_line1_dom(str(address["street"]))
         self.expand_stripe_manual_address()
+        if japan_address and self.visible_selector(line1) and self.field_value(line1).strip() != str(address["street"]):
+            if not self.type_field(line1, address["street"], timeout=1, fast=True):
+                self.fill_stripe_line1_dom(str(address["street"]))
+        line2_value = str(address.get("line2") or address.get("building") or "").strip()
+        line2_selectors = [
+            "#billingAddressLine2",
+            "input[name='billingAddressLine2']",
+            "input[name='billingAddress.line2']",
+            "input[name='addressLine2']",
+            "input[autocomplete='address-line2']",
+            "input[placeholder*='住所 (2']",
+            "input[aria-label*='住所 (2']",
+        ]
+        if japan_address and line2_value and self.visible_selector(line2_selectors) and self.field_value(line2_selectors).strip() != line2_value:
+            self.type_field(line2_selectors, line2_value, timeout=1, fast=True)
         name_selectors = ["#billingName", "input[name='billingName']", "input[name='name']"]
         if full_name and self.visible_selector(name_selectors):
             self.type_field(name_selectors, full_name, timeout=1)
             time.sleep(random.uniform(0.12, 0.28))
         # If Stripe autocomplete filled locality/postal fields, do not rewrite them.
         city_selectors = ["#billingLocality", "input[name='billingLocality']"]
-        if self.visible_selector(city_selectors) and not self.field_value(city_selectors):
+        if self.visible_selector(city_selectors) and (japan_address or not self.field_value(city_selectors)):
             self.type_field(city_selectors, address["city"], timeout=1)
         postal_selectors = ["#billingPostalCode", "input[name='billingPostalCode']"]
-        if self.visible_selector(postal_selectors) and not self.field_value(postal_selectors):
+        if self.visible_selector(postal_selectors) and (japan_address or not self.field_value(postal_selectors)):
             self.type_field(postal_selectors, address["zipCode"], timeout=1)
         state_selectors = ["#billingAdministrativeArea", "select[name='billingAdministrativeArea']"]
-        if self.visible_selector(state_selectors) and not self.field_value(state_selectors):
+        if self.visible_selector(state_selectors) and (japan_address or not self.field_value(state_selectors)):
             self.select_state(address["state"])
         state = self.ensure_stripe_billing_complete(address, timeout=4)
         if not state.get("ok"):
             raise RuntimeError(f"Stripe billing address incomplete: {state}")
         self.press_key("Escape")
+
+    def ensure_stripe_country(self, address: dict[str, Any]) -> None:
+        result = self.js(
+            r"""
+(() => {
+  function visible(el) {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && !el.disabled && style.visibility !== 'hidden' && style.display !== 'none';
+  }
+  const selectors = [
+    "select[name='billingAddressCountry']",
+    "#billingAddressCountry",
+    "select[name='billingCountry']",
+    "#billingCountry",
+    "select[name='billingAddress.country']",
+    "select[autocomplete='country']",
+    "select[autocomplete='country-name']",
+    "select[name*='country' i]",
+    "select[id*='country' i]"
+  ];
+  const desired = ['JP', 'JPN', 'Japan', '日本'];
+  for (const selector of selectors) {
+    let el = null;
+    try { el = document.querySelector(selector); } catch (_) { el = null; }
+    if (!visible(el)) continue;
+    const options = [...el.options];
+    const current = String(el.value || '').trim();
+    const curOpt = options.find((o) => o.value === current);
+    const curText = curOpt ? String(curOpt.textContent || '').trim() : '';
+    if (desired.some((x) => current.toLowerCase() === x.toLowerCase() || curText.toLowerCase() === x.toLowerCase())) {
+      return {ok:true, changed:false, selector, current, currentText:curText};
+    }
+    const found = options.find((opt) => desired.some((x) =>
+      String(opt.value || '').trim().toLowerCase() === x.toLowerCase() ||
+      String(opt.textContent || '').trim().toLowerCase() === x.toLowerCase()
+    ));
+    if (!found) return {ok:false, reason:'jp_option_not_found', selector, options: options.map((o) => ({value:o.value, text:o.textContent})).slice(0, 80)};
+    el.value = found.value;
+    el.dispatchEvent(new Event('input', {bubbles:true}));
+    el.dispatchEvent(new Event('change', {bubbles:true}));
+    return {ok:true, changed:true, selector, value:found.value, text:found.textContent};
+  }
+  return {ok:false, reason:'country_select_not_found'};
+})()
+""",
+            timeout=5,
+        )
+        log(f"[stripe] ensure country JP: {result}")
+        if isinstance(result, dict) and result.get("changed"):
+            time.sleep(1.2)
 
     def stripe_paypal_selected(self) -> bool:
         return bool(
@@ -2657,12 +2959,125 @@ class RuyiPayPalFlow:
                         pass
                 next_move = time.time() + random.uniform(0.7, 1.2)
             time.sleep(0.2)
+        if self.wait_for_url_any(needles, timeout=1):
+            return True
+        processing = self.stripe_submit_processing_state()
+        if processing.get("processing"):
+            log(f"[stripe] submit still processing; wait for redirect: {processing}")
+            extra_deadline = time.time() + 22
+            while time.time() < extra_deadline:
+                url = self.current_url()
+                if any(n in url for n in needles):
+                    return True
+                if self.wait_for_url_any(needles, timeout=0.5):
+                    return True
+                processing = self.stripe_submit_processing_state()
+                if not processing.get("processing") and time.time() - started >= min_wait:
+                    break
+                time.sleep(0.25)
         return self.wait_for_url_any(needles, timeout=1)
+
+    def stripe_submit_processing_state(self) -> dict[str, Any]:
+        try:
+            state = self.js(
+                r"""
+(() => {
+  const btn =
+    document.querySelector("button[data-testid='hosted-payment-submit-button']") ||
+    document.querySelector('.SubmitButton-IconContainer')?.closest('button') ||
+    document.querySelector('button[type=submit]');
+  if (!btn) return {processing:false, reason:'submit_not_found'};
+  const text = [btn.innerText || btn.textContent || '', btn.value || '', btn.getAttribute('aria-label') || '']
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const disabled = Boolean(btn.disabled || btn.getAttribute('aria-disabled') === 'true');
+  const processing = disabled && /process|processing|プロセス|処理|送信中/i.test(text);
+  return {processing, disabled, text};
+})()
+""",
+                timeout=2,
+            )
+            return state if isinstance(state, dict) else {}
+        except Exception:
+            return {}
+
+    def save_stripe_checkout_diagnostics(self, label: str) -> None:
+        try:
+            data = self.js(
+                r"""
+(() => {
+  function visible(el) {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  }
+  function labelFor(el) {
+    const id = el.id || '';
+    const labels = id ? [...document.querySelectorAll(`label[for="${CSS.escape(id)}"]`)].map((x) => x.innerText || x.textContent || '') : [];
+    const parent = el.closest('label');
+    if (parent) labels.push(parent.innerText || parent.textContent || '');
+    const group = el.closest('[data-testid], [role], form, section, div');
+    if (group) labels.push((group.innerText || group.textContent || '').slice(0, 240));
+    return labels.join(' | ').replace(/\s+/g, ' ').trim();
+  }
+  function attrs(el) {
+    return {
+      tag: el.tagName,
+      id: el.id || '',
+      name: el.name || '',
+      type: el.type || '',
+      role: el.getAttribute('role') || '',
+      testid: el.getAttribute('data-testid') || '',
+      autocomplete: el.getAttribute('autocomplete') || '',
+      placeholder: el.getAttribute('placeholder') || '',
+      aria: el.getAttribute('aria-label') || '',
+      checked: Boolean(el.checked),
+      disabled: Boolean(el.disabled),
+      value: String(el.value || '').slice(0, 80),
+      text: String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 180),
+      label: labelFor(el),
+    };
+  }
+  const fields = [...document.querySelectorAll('input,select,textarea,button,[role="radio"],[role="button"],[data-testid]')]
+    .filter(visible)
+    .slice(0, 180)
+    .map(attrs);
+  const paypalHints = fields.filter((x) => /paypal/i.test([x.id, x.name, x.testid, x.aria, x.value, x.text, x.label].join(' '))).slice(0, 40);
+  const errors = [...document.querySelectorAll('[role="alert"], .Error, .error, [class*="error" i], [data-testid*="error" i]')]
+    .filter(visible)
+    .map((el) => String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .slice(0, 40);
+  return {
+    url: location.href,
+    title: document.title,
+    active: document.activeElement ? attrs(document.activeElement) : null,
+    paypalHints,
+    errors,
+    fields,
+    text: (document.body && document.body.innerText || '').slice(0, 3500),
+  };
+})()
+""",
+                timeout=5,
+            )
+            out = Path(self.args.result_json).with_name(f"{Path(self.args.result_json).stem}_{label}.json")
+            out.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            log(f"[stripe] checkout diagnostic saved: {out}")
+        except Exception as exc:
+            log(f"[stripe] checkout diagnostic failed: {type(exc).__name__}: {exc}")
 
     def choose_paypal_on_stripe(self, address: dict[str, Any]) -> bool:
         self.wait_stripe_content_or_refresh(timeout=90, blank_seconds=8)
-        self.wait_stripe_amount_sample(timeout=120)
+        try:
+            self.wait_stripe_amount_sample(timeout=120)
+        except Exception:
+            self.save_stripe_checkout_diagnostics("stripe_amount_check_failed")
+            raise
         if not self.select_stripe_paypal_method(timeout=8):
+            self.save_stripe_checkout_diagnostics("stripe_paypal_select_failed")
             return False
         self.human_pause(0.2, 0.45)
         self.fill_stripe_billing_address(address)
@@ -2683,6 +3098,7 @@ class RuyiPayPalFlow:
         if not self.stripe_paypal_selected():
             log("[stripe] PayPal not selected after billing fill; retry select")
             if not self.select_stripe_paypal_method(timeout=4):
+                self.save_stripe_checkout_diagnostics("stripe_paypal_lost_after_billing")
                 return False
         billing_state = self.ensure_stripe_billing_complete(address, timeout=5)
         if not billing_state.get("ok"):
@@ -2697,6 +3113,7 @@ class RuyiPayPalFlow:
             if self.stripe_payment_method_required():
                 log("[stripe] payment method still required; reselect PayPal and resubmit")
                 if not self.select_stripe_paypal_method(timeout=5):
+                    self.save_stripe_checkout_diagnostics("stripe_payment_method_required_after_submit")
                     break
                 self.human_pause(0.15, 0.35)
                 continue
@@ -2706,6 +3123,7 @@ class RuyiPayPalFlow:
                     continue
             break
         if not self.stripe_paypal_selected():
+            self.save_stripe_checkout_diagnostics("stripe_paypal_submit_no_redirect")
             return False
         submitted = bool(
             self.js(
@@ -2727,7 +3145,11 @@ class RuyiPayPalFlow:
             )
         )
         if submitted:
-            return self.wait_after_stripe_submit(min_wait=1.0, max_wait=5.5)
+            advanced = self.wait_after_stripe_submit(min_wait=1.0, max_wait=5.5)
+            if not advanced:
+                self.save_stripe_checkout_diagnostics("stripe_submit_no_redirect")
+            return advanced
+        self.save_stripe_checkout_diagnostics("stripe_submit_failed")
         return False
 
     def run(self) -> dict[str, Any]:
@@ -2737,7 +3159,6 @@ class RuyiPayPalFlow:
         card = load_card(self.args.card_json)
         additional = self.profile.get("additional") or {}
         additional.setdefault("password", "Aa" + "".join(random.choice(string.ascii_letters + string.digits) for _ in range(10)) + "1!")
-        sms_phone, sms_api = parse_sms_line(self.args.sms_line)
         exp_month, exp_year = split_expiry(card["expiry"])
         paypal_contact = dict(contact)
         paypal_contact["email"] = random_gmail()
@@ -2758,8 +3179,14 @@ class RuyiPayPalFlow:
             log("[step] move from PayPal login to signup/guest checkout")
         self.wait_paypal_signup_ready(paypal_contact, timeout=140)
 
+        # Acquire paid SMS numbers only after PayPal's signup form is actually reachable.
+        sms_phone, sms_api = parse_sms_line(self.args.sms_line)
         paypal_first_name = str(personal.get("firstName") or random_letters(5)).strip()
         paypal_last_name = str(personal.get("lastName") or random_letters(6)).strip()
+        if is_japan_address(address):
+            paypal_first_name = str(personal.get("firstNameKanji") or personal.get("firstName") or "太郎").strip()
+            paypal_last_name = str(personal.get("lastNameKanji") or personal.get("lastName") or "田中").strip()
+        paypal_submit_phone = paypal_phone_for_country(sms_phone, address_country(address))
 
         sms_poller = None
         sms_baseline = ""
@@ -2787,7 +3214,7 @@ class RuyiPayPalFlow:
                     interval=1.0,
                 )
             try:
-                self.submit_paypal_signup(sms_phone, paypal_first_name, paypal_last_name)
+                self.submit_paypal_signup(paypal_submit_phone, paypal_first_name, paypal_last_name)
                 break
             except FlowFailed as exc:
                 if sms_poller:
@@ -2807,9 +3234,12 @@ class RuyiPayPalFlow:
                 raise
 
         self.safe_handle_captcha_if_present(detect_wait=8)
-        self.handle_sms_if_present(sms_api, sms_baseline, sms_poller)
+        sms_ok = self.handle_sms_if_present(sms_api, sms_baseline, sms_poller)
         if sms_poller:
             sms_poller.stop()
+        sms_failure = self.fail_if_sms_pending_without_code(sms_ok)
+        if sms_failure is not None:
+            return sms_failure
         self.safe_handle_captcha_if_present(detect_wait=1)
         final_state = self.handle_final_confirmation_if_present()
         if final_state == "login_fallback":
@@ -2855,14 +3285,17 @@ class RuyiPayPalFlow:
                     baseline=retry_baseline,
                     timeout=int(self.args.sms_timeout),
                     interval=1.0,
-                )
+            )
             try:
-                self.submit_paypal_signup(sms_phone, paypal_first_name, paypal_last_name)
+                self.submit_paypal_signup(paypal_submit_phone, paypal_first_name, paypal_last_name)
                 self.safe_handle_captcha_if_present(detect_wait=8)
-                self.handle_sms_if_present(sms_api, retry_baseline, retry_poller)
+                retry_sms_ok = self.handle_sms_if_present(sms_api, retry_baseline, retry_poller)
             finally:
                 if retry_poller:
                     retry_poller.stop()
+            retry_sms_failure = self.fail_if_sms_pending_without_code(retry_sms_ok)
+            if retry_sms_failure is not None:
+                return retry_sms_failure
             self.safe_handle_captcha_if_present(detect_wait=1)
             self.handle_final_confirmation_if_present()
             log("[step] wait for final redirect/result after PayPal form retry")
@@ -2911,12 +3344,15 @@ class RuyiPayPalFlow:
                 interval=1.0,
             )
         try:
-            self.submit_paypal_signup(sms_phone, first_name, last_name)
+            self.submit_paypal_signup(paypal_phone_for_country(sms_phone, address_country(address)), first_name, last_name)
             self.safe_handle_captcha_if_present(detect_wait=8)
-            self.handle_sms_if_present(sms_api, baseline, poller)
+            sms_ok = self.handle_sms_if_present(sms_api, baseline, poller)
         finally:
             if poller:
                 poller.stop()
+        sms_failure = self.fail_if_sms_pending_without_code(sms_ok)
+        if sms_failure is not None:
+            return sms_failure
         self.safe_handle_captcha_if_present(detect_wait=1)
         self.handle_final_confirmation_if_present()
         log("[step] wait for final redirect/result after Hermes login fallback retry")
@@ -2941,18 +3377,19 @@ class RuyiPayPalFlow:
   };
   const text = document.body && document.body.innerText || '';
   const onboardingEmailEl = q('#onboardingFlowEmail') || q('#login_email') || q("input[placeholder='Enter email']");
-  const createLabels = buttonLabels.filter((x) => /Create\\s+(an?\\s+)?Account/i.test(x) && !/Agree|Continue|Payment/i.test(x));
+  const createLabels = buttonLabels.filter((x) => /(Create\\s+(an?\\s+)?Account|アカウント作成|アカウントを作成)/i.test(x) && !/Agree|Continue|Payment|同意/i.test(x));
   return {
     url: location.href,
     title: document.title,
     text: text.slice(0, 1200),
     cardReady: visible(q('#cardNumber')) || visible(q("input[name='cardNumber']")),
     detailReady: visible(q('#firstName')) || visible(q('#lastName')) || visible(q('#phone')) || visible(q('#billingLine1')),
+    signupSubmitReady: buttonLabels.some((x) => /Agree\s*&\s*Create Account|Agree and Create Account|同意.*アカウント|アカウント.*作成|同意して.*作成|同意して続行/i.test(x)),
     onboardingEmail: visible(onboardingEmailEl),
     onboardingEmailValue: onboardingEmailEl ? String(onboardingEmailEl.value || '') : '',
     createButton: visible(q('#startOnboardingFlow')) || visible(q('#guestCheckout')) || createLabels.length > 0,
     createButtonText: createLabels[0] || '',
-    continueButton: buttonLabels.some((x) => /^Continue$/i.test(x) || /Continue to Payment/i.test(x)),
+	    continueButton: buttonLabels.some((x) => /^Continue$/i.test(x) || /Continue to Payment|続行|支払いに進む|支払いを続ける/i.test(x)),
     paypalClientCfci: /paypal_client_cfci/i.test(location.href),
     captcha: /authchallenge/i.test(location.href) || /captcha|robot|security check|Security Challenge/i.test(text),
     buttons: buttonLabels.slice(0, 20)
@@ -2971,17 +3408,20 @@ class RuyiPayPalFlow:
             if self.field_value(email_selectors) != contact["email"] and not self.type_field(email_selectors, contact["email"], timeout=6):
                 return False
             time.sleep(0.4)
-            return self.click_by_text([r"^Continue to Payment$", r"continue to payment", r"^continue$"], timeout=6)
+            return self.click_by_text([r"^Continue to Payment$", r"continue to payment", r"^continue$", r"支払いに進む", r"支払いを続ける", r"続行"], timeout=6)
 
         deadline = time.time() + timeout
         last_url = ""
         pay_url_seen_at = 0.0
         approve_url_seen_at = 0.0
         pay_fallback_clicks = 0
+        first_create_click_at = 0.0
         last_create_click_at = 0.0
         last_email_submit_at = 0.0
+        first_email_submit_at = 0.0
         email_submit_probe_until = 0.0
         approve_stall_logged_at = 0.0
+        jp_signup_ready_since = 0.0
         while time.time() < deadline:
             cur = state()
             url = str(cur.get("url") or "")
@@ -2993,21 +3433,44 @@ class RuyiPayPalFlow:
                 approve_stall_logged_at = 0.0
                 pay_fallback_clicks = 0
             if cur.get("cardReady") or cur.get("detailReady"):
+                if "country.x=JP" in url or "locale.x=ja_JP" in url or "日本" in str(cur.get("text") or ""):
+                    full_ready = bool(cur.get("cardReady") and cur.get("detailReady") and cur.get("signupSubmitReady"))
+                    if full_ready:
+                        if not jp_signup_ready_since:
+                            jp_signup_ready_since = time.time()
+                            time.sleep(0.25)
+                            continue
+                        if time.time() - jp_signup_ready_since >= 1.0:
+                            return
+                    else:
+                        jp_signup_ready_since = 0.0
+                        time.sleep(0.25)
+                        continue
                 return
             if cur.get("onboardingEmail"):
                 if time.time() < email_submit_probe_until:
                     time.sleep(0.2)
                     continue
-                if time.time() - last_email_submit_at >= 1.2:
+                if first_email_submit_at and time.time() - first_email_submit_at > 12:
+                    self.save_paypal_signup_diagnostics("paypal_onboarding_email_stalled")
+                    raise RuntimeError("PayPal onboarding email did not advance after submit")
+                if time.time() - last_email_submit_at >= 3.0:
                     log("[paypal] submit onboarding email")
+                    if not first_email_submit_at:
+                        first_email_submit_at = time.time()
                     last_email_submit_at = time.time()
-                    email_submit_probe_until = time.time() + 0.8
+                    email_submit_probe_until = time.time() + 1.4
                     if submit_onboarding_email():
-                        time.sleep(0.8)
+                        time.sleep(1.2)
                         continue
                 time.sleep(0.25)
                 continue
             if cur.get("createButton"):
+                if not first_create_click_at:
+                    first_create_click_at = time.time()
+                if "paypal.com/agreements/approve" in url and time.time() - first_create_click_at > 32:
+                    self.save_paypal_signup_diagnostics("paypal_create_account_stalled")
+                    raise RuntimeError(f"PayPal Create Account did not advance after {time.time() - first_create_click_at:.1f}s")
                 if time.time() - last_create_click_at < 2.8:
                     time.sleep(0.5)
                     continue
@@ -3059,7 +3522,190 @@ class RuyiPayPalFlow:
                 time.sleep(1)
                 continue
             time.sleep(1)
+        self.save_paypal_signup_diagnostics("paypal_signup_ready_timeout")
         raise TimeoutError("PayPal signup form did not become ready")
+
+    def save_paypal_signup_diagnostics(self, label: str) -> None:
+        try:
+            data = self.js(
+                r"""
+(() => {
+  function visible(el) {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  }
+  function labelFor(el) {
+    const id = el.id || '';
+    const labels = id ? [...document.querySelectorAll(`label[for="${CSS.escape(id)}"]`)].map((x) => x.innerText || x.textContent || '') : [];
+    const parent = el.closest('label');
+    if (parent) labels.push(parent.innerText || parent.textContent || '');
+    const group = el.closest('[class*="field"], [class*="form"], div, li');
+    if (group) labels.push((group.innerText || group.textContent || '').slice(0, 160));
+    return labels.join(' | ').replace(/\s+/g, ' ').trim();
+  }
+  const inputs = [...document.querySelectorAll('input,select,textarea')]
+    .filter(visible)
+    .map((el) => ({
+      tag: el.tagName,
+      id: el.id || '',
+      name: el.name || '',
+      type: el.type || '',
+      autocomplete: el.getAttribute('autocomplete') || '',
+      placeholder: el.getAttribute('placeholder') || '',
+      aria: el.getAttribute('aria-label') || '',
+      value: String(el.value || '').slice(0, 40),
+      label: labelFor(el),
+      options: el.tagName === 'SELECT' ? [...el.options].slice(0, 80).map((o) => ({value:o.value, text:o.textContent})) : []
+    }));
+  const buttons = [...document.querySelectorAll('button, input[type=submit], [role=button]')]
+    .filter(visible)
+    .map((el) => [el.innerText || el.textContent || '', el.value || '', el.getAttribute('aria-label') || '', el.id || '', el.name || ''].join(' ').replace(/\s+/g, ' ').trim())
+    .slice(0, 40);
+  return {url: location.href, title: document.title, inputs, buttons, text: (document.body && document.body.innerText || '').slice(0, 2000)};
+})()
+""",
+                timeout=5,
+            )
+            out = Path(self.args.result_json).with_name(f"{Path(self.args.result_json).stem}_{label}.json")
+            out.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            log(f"[paypal] signup diagnostic saved: {out}")
+        except Exception as exc:
+            log(f"[paypal] signup diagnostic failed: {type(exc).__name__}: {exc}")
+
+    def ensure_paypal_country(self, address: dict[str, Any]) -> None:
+        country = address_country(address)
+        if country not in {"JP", "JPN", "JAPAN", "日本"}:
+            return
+        result = self.js(
+            r"""
+(() => {
+  function visible(el) {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && !el.disabled && style.visibility !== 'hidden' && style.display !== 'none';
+  }
+  const selectors = [
+    "select[name='country']",
+    "#country",
+    "select[name='countryCode']",
+    "#countryCode",
+    "select[name='billingCountry']",
+    "#billingCountry",
+    "select[name='billingAddress.country']",
+    "select[autocomplete='country']",
+    "select[autocomplete='country-name']",
+    "select[name*='country' i]",
+    "select[id*='country' i]"
+  ];
+  const desired = ['JP', 'JPN', 'Japan', '日本'];
+  for (const selector of selectors) {
+    let el = null;
+    try { el = document.querySelector(selector); } catch (_) { el = null; }
+    if (!visible(el)) continue;
+    const current = String(el.value || '').trim();
+    const options = [...el.options];
+    const curOpt = options.find((o) => o.value === current);
+    const curText = curOpt ? String(curOpt.textContent || '').trim() : '';
+    if (desired.some((x) => current.toLowerCase() === x.toLowerCase() || curText.toLowerCase() === x.toLowerCase())) {
+      return {ok:true, changed:false, selector, current, currentText:curText};
+    }
+    const found = options.find((opt) => desired.some((x) =>
+      String(opt.value || '').trim().toLowerCase() === x.toLowerCase() ||
+      String(opt.textContent || '').trim().toLowerCase() === x.toLowerCase()
+    ));
+    if (!found) return {ok:false, changed:false, selector, reason:'jp_option_not_found', options: options.map((o) => ({value:o.value, text:o.textContent})).slice(0, 80)};
+    el.value = found.value;
+    el.dispatchEvent(new Event('input', {bubbles:true}));
+    el.dispatchEvent(new Event('change', {bubbles:true}));
+    return {ok:true, changed:true, selector, value:found.value, text:found.textContent};
+  }
+  return {ok:false, changed:false, reason:'country_select_not_found'};
+})()
+""",
+            timeout=5,
+        )
+        log(f"[paypal] ensure country JP: {result}")
+        if isinstance(result, dict) and result.get("changed"):
+            time.sleep(1.6)
+            self.wait_ready(timeout=15)
+
+    def fill_japanese_name_fields(self, personal: dict[str, Any]) -> dict[str, Any]:
+        values = {
+            "firstKana": str(personal.get("firstNameKana") or "タロウ"),
+            "lastKana": str(personal.get("lastNameKana") or "タナカ"),
+            "firstKanji": str(personal.get("firstNameKanji") or personal.get("firstName") or "太郎"),
+            "lastKanji": str(personal.get("lastNameKanji") or personal.get("lastName") or "田中"),
+        }
+        result = self.js(
+            f"""
+(() => {{
+  const values = {json.dumps(values, ensure_ascii=False)};
+  function visible(el) {{
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && !el.disabled && style.visibility !== 'hidden' && style.display !== 'none';
+  }}
+  function textFor(el) {{
+    const parts = [el.id || '', el.name || '', el.autocomplete || '', el.placeholder || '', el.getAttribute('aria-label') || ''];
+    if (el.id) {{
+      parts.push(...[...document.querySelectorAll(`label[for="${{CSS.escape(el.id)}}"]`)].map((x) => x.innerText || x.textContent || ''));
+    }}
+    const parent = el.closest('label');
+    if (parent) parts.push(parent.innerText || parent.textContent || '');
+    const group = el.closest('[class*="field"], [class*="form"], div, li');
+    if (group) parts.push((group.innerText || group.textContent || '').slice(0, 180));
+    return parts.join(' ').replace(/\\s+/g, ' ');
+  }}
+	  function setValue(el, value) {{
+	    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+	    el.scrollIntoView({{block:'center', inline:'center'}});
+	    el.focus();
+	    if (setter) setter.call(el, value);
+    else el.value = value;
+    el.dispatchEvent(new InputEvent('input', {{bubbles:true, inputType:'insertText', data:value}}));
+    el.dispatchEvent(new Event('change', {{bubbles:true}}));
+	  }}
+	  const out = {{}};
+	  const direct = [
+	    ['firstKana', '#countrySpecificFirstName'],
+	    ['lastKana', '#countrySpecificLastName'],
+	    ['firstKanji', '#firstName'],
+	    ['lastKanji', '#lastName']
+	  ];
+	  for (const [key, selector] of direct) {{
+	    const el = document.querySelector(selector);
+	    if (visible(el)) {{
+	      setValue(el, values[key]);
+	      out[key] = {{id: el.id || '', name: el.name || '', value: values[key], selector}};
+	    }}
+	  }}
+	  const inputs = [...document.querySelectorAll('input')].filter(visible);
+	  for (const el of inputs) {{
+	    if (/billing|address|postal|city|phone|card|cvv|expiry|birth|password|email/i.test([el.id || '', el.name || '', el.autocomplete || ''].join(' '))) continue;
+	    const t = textFor(el);
+	    if (!/(name|first|last|given|family|姓|名|カナ|かな|フリガナ|氏名)/i.test(t)) continue;
+	    const isKana = /(kana|カナ|かな|フリガナ)/i.test(t);
+    const isLast = /(last|family|surname|姓|sei)/i.test(t);
+    const isFirst = /(first|given|名|mei)/i.test(t) && !isLast;
+    let key = '';
+    if (isKana && isLast) key = 'lastKana';
+    else if (isKana && isFirst) key = 'firstKana';
+    else if (!isKana && isLast) key = 'lastKanji';
+    else if (!isKana && isFirst) key = 'firstKanji';
+    if (!key || out[key]) continue;
+    setValue(el, values[key]);
+    out[key] = {{id: el.id || '', name: el.name || '', value: values[key], text: t.slice(0, 120)}};
+  }}
+  return out;
+}})()
+""",
+            timeout=5,
+        )
+        return result if isinstance(result, dict) else {}
 
     def fill_signup_form(
         self,
@@ -3074,9 +3720,21 @@ class RuyiPayPalFlow:
         first_name: str,
         last_name: str,
     ) -> None:
+        japan_address = is_japan_address(address)
+        if japan_address:
+            self.save_paypal_signup_diagnostics("paypal_jp_signup_before_fill")
+            self.ensure_paypal_country(address)
+        paypal_phone = paypal_phone_for_country(sms_phone, address_country(address))
+        birth_date = str(
+            personal.get("dateOfBirth")
+            or personal.get("birthDate")
+            or additional.get("dateOfBirth")
+            or additional.get("birthDate")
+            or "19800101"
+        )
         fields = [
             ("email", ["input[name='email']", "#email", "#login_email", "#onboardingFlowEmail", "input[name='login_email'][type='email']", "input[type='email']"], contact["email"]),
-            ("phone", ["#phone", "input[name='phoneNumber']", "input[type='tel']", "input[name='phone']"], sms_phone[-10:]),
+            ("phone", ["#phone", "input[name='phoneNumber']", "input[type='tel']", "input[name='phone']"], paypal_phone),
             ("password", ["input[name='password']", "#password", "input[type='password']"], additional["password"]),
             ("firstName", ["#firstName", "input[name='firstName']", "input[name='fname']", "#cardFirstName", "input[autocomplete='given-name']", "input[aria-label='First name']"], first_name),
             ("lastName", ["#lastName", "input[name='lastName']", "input[name='lname']", "#cardLastName", "input[autocomplete='family-name']", "input[aria-label='Last name']"], last_name),
@@ -3084,40 +3742,118 @@ class RuyiPayPalFlow:
             ("expiryDate", ["input[name='expiryDate']", "#expiryDate", "#cardExpiry", "input[aria-label='MM / YY']"], f"{exp_month}/{exp_year}"),
             ("cvv", ["input[name='cvvNumber']", "#cvv", "#cardCvv", "input[aria-label='CSC']"], str(card["cvv"])),
         ]
+        if japan_address:
+            fields.append(("dateOfBirth", ["#dateOfBirth", "input[name='dateOfBirth']", "input[aria-label*='生年月日']", "input[placeholder*='生年月日']"], birth_date))
         line1_selectors = ["input[name='line1']", "#line1", "#billingLine1", "input[autocomplete='address-line1']"]
         city_selectors = ["input[name='city']", "#city", "#billingCity", "input[autocomplete='address-level2']"]
         postal_selectors = ["input[name='postalCode']", "#postalCode", "#billingPostalCode", "#zipCode", "input[autocomplete='postal-code']"]
+        paypal_line1 = str(address["street"]) if japan_address else self.address_lookup_seed(address)
         fast_fields = [(name, selectors, str(value)) for name, selectors, value in fields]
         fast_fields.extend(
             [
-                ("line1", line1_selectors, self.address_lookup_seed(address)),
+                ("line1", line1_selectors, paypal_line1),
                 ("city", city_selectors, str(address["city"])),
                 ("postalCode", postal_selectors, str(address["zipCode"])),
             ]
         )
         fast_result = self.fill_visible_fields_fast(fast_fields)
+        bidi_required = {"phone", "cardNumber", "expiryDate", "cvv", "dateOfBirth"} if japan_address else set()
         for name, selectors, value in fields:
             ok = bool(fast_result.get(name))
-            if not ok:
+            if name in bidi_required:
+                ok = self.type_field(selectors, str(value), timeout=2, fast=True)
+            elif not ok:
                 ok = self.type_field(selectors, str(value), timeout=2, fast=True)
             log(f"  field {name}: {'ok' if ok else 'missing'}")
             if not ok:
                 time.sleep(random.uniform(0.08, 0.18))
         ok = bool(fast_result.get("line1"))
         if not ok:
-            ok = self.type_field(line1_selectors, self.address_lookup_seed(address), timeout=1, fast=True)
+            ok = self.type_field(line1_selectors, paypal_line1, timeout=1, fast=True)
         log(f"  field line1: {'ok' if ok else 'missing'}")
         time.sleep(random.uniform(0.03, 0.08))
-        if not self.select_paypal_address_autocomplete() and len(self.field_value(line1_selectors).strip()) < 5:
+        if japan_address and self.visible_selector(line1_selectors) and self.field_value(line1_selectors).strip() != str(address["street"]):
             self.type_field(line1_selectors, str(address["street"]), timeout=1, fast=True)
-        if not fast_result.get("city") and self.visible_selector(city_selectors) and not self.field_value(city_selectors):
+        if not japan_address and not self.select_paypal_address_autocomplete() and len(self.field_value(line1_selectors).strip()) < 5:
+            self.type_field(line1_selectors, str(address["street"]), timeout=1, fast=True)
+        if self.visible_selector(city_selectors) and (japan_address or (not fast_result.get("city") and not self.field_value(city_selectors))):
             self.type_field(city_selectors, str(address["city"]), timeout=0.7, fast=True)
-        if not fast_result.get("postalCode") and self.visible_selector(postal_selectors) and not self.field_value(postal_selectors):
+        if self.visible_selector(postal_selectors) and (japan_address or (not fast_result.get("postalCode") and not self.field_value(postal_selectors))):
             self.type_field(postal_selectors, str(address["zipCode"]), timeout=0.7, fast=True)
+        line2 = str(address.get("line2") or address.get("building") or "").strip()
+        if line2:
+            line2_selectors = [
+                "input[name='line2']",
+                "#line2",
+                "#billingLine2",
+                "input[autocomplete='address-line2']",
+                "input[placeholder*='建物']",
+                "input[aria-label*='建物']",
+            ]
+            if self.visible_selector(line2_selectors) and (japan_address or not self.field_value(line2_selectors)):
+                self.type_field(line2_selectors, line2, timeout=0.7, fast=True)
         state_selectors = ["select[name='state']", "select#state", "#billingState", "select[name='billingState']", "[name='billingAddress.state']"]
         if self.visible_selector(state_selectors):
             self.select_state(address["state"])
+        if japan_address:
+            self.force_japan_paypal_address_fields(address)
+            jp_names = self.fill_japanese_name_fields(personal)
+            log(f"[paypal] JP name fields: {jp_names}")
         self.click_by_selector(["#cardAddButton", "button[name='cardAddButton']"], timeout=1)
+
+    def force_japan_paypal_address_fields(self, address: dict[str, Any]) -> None:
+        values = {
+            "billingPostalCode": str(address.get("zipCode") or "0788381"),
+            "billingState": str(address.get("state") or "北海道"),
+            "billingCity": str(address.get("city") or "旭川市"),
+            "billingLine1": str(address.get("street") or "西神楽一線十七号"),
+            "billingLine2": str(address.get("line2") or address.get("building") or "グリーンヒル203"),
+        }
+        result = self.js(
+            f"""
+(() => {{
+  const values = {json.dumps(values, ensure_ascii=False)};
+  function visible(el) {{
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && !el.disabled && style.visibility !== 'hidden' && style.display !== 'none';
+  }}
+  function setInput(id, value) {{
+    const el = document.getElementById(id);
+    if (!visible(el)) return false;
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    if (setter) setter.call(el, value);
+    else el.value = value;
+    el.dispatchEvent(new InputEvent('input', {{bubbles:true, inputType:'insertText', data:value}}));
+    el.dispatchEvent(new Event('change', {{bubbles:true}}));
+    el.dispatchEvent(new Event('blur', {{bubbles:true}}));
+    return true;
+  }}
+  function setSelect(id, value) {{
+    const el = document.getElementById(id);
+    if (!visible(el)) return false;
+    const options = [...el.options];
+    const found = options.find((o) => String(o.value || '').trim() === value || String(o.textContent || '').trim() === value);
+    if (!found) return false;
+    el.value = found.value;
+    el.dispatchEvent(new Event('input', {{bubbles:true}}));
+    el.dispatchEvent(new Event('change', {{bubbles:true}}));
+    el.dispatchEvent(new Event('blur', {{bubbles:true}}));
+    return true;
+  }}
+  return {{
+    postal: setInput('billingPostalCode', values.billingPostalCode),
+    state: setSelect('billingState', values.billingState),
+    city: setInput('billingCity', values.billingCity),
+    line1: setInput('billingLine1', values.billingLine1),
+    line2: setInput('billingLine2', values.billingLine2),
+  }};
+}})()
+""",
+            timeout=3,
+        )
+        log(f"[paypal] JP address fields forced: {result}")
 
     def submit_paypal_signup(self, sms_phone: str, first_name: str, last_name: str) -> None:
         def diagnostics_state() -> dict[str, Any]:
@@ -3138,7 +3874,7 @@ class RuyiPayPalFlow:
     .find((el) => {{
       const r = el.getBoundingClientRect();
       const text = [el.innerText || el.textContent || '', el.value || '', el.getAttribute('aria-label') || ''].join(' ');
-      return r.width > 0 && r.height > 0 && /Agree\\s*&\\s*Create Account|Agree and Create Account/i.test(text);
+	      return r.width > 0 && r.height > 0 && /Agree\\s*&\\s*Create Account|Agree and Create Account|同意.*アカウント|アカウント.*作成|同意して.*作成|同意して続行/i.test(text);
     }});
   const form = btn && btn.closest('form');
   return {{
@@ -3166,6 +3902,22 @@ class RuyiPayPalFlow:
         if any(re.search(r"phone", " ".join(str(x.get(k, "")) for k in ("id", "name", "message")), re.I) for x in invalids or []):
             log("[paypal] phone invalid before submit; refill visible phone field")
             self.type_field(["#phone", "input[name='phoneNumber']", "input[type='tel']", "input[name='phone']"], sms_phone[-10:], timeout=2, fast=True)
+        if any(re.search(r"cardNumber|cardnumber", " ".join(str(x.get(k, "")) for k in ("id", "name", "message")), re.I) for x in invalids or []):
+            log("[paypal] card number invalid before submit; refill visible card field")
+            card = load_card(self.args.card_json)
+            self.type_field(["input[name='cardNumber']", "#cardNumber", "input[aria-label='Card number']"], card["cardNumber"], timeout=2, fast=True)
+        if any(re.search(r"cardExpiry|expiry|exp-date", " ".join(str(x.get(k, "")) for k in ("id", "name", "message")), re.I) for x in invalids or []):
+            log("[paypal] expiry invalid before submit; refill visible expiry field")
+            card = load_card(self.args.card_json)
+            exp_month, exp_year = split_expiry(card["expiry"])
+            self.type_field(["input[name='expiryDate']", "#expiryDate", "#cardExpiry", "input[aria-label='MM / YY']"], f"{exp_month}/{exp_year}", timeout=2, fast=True)
+        if any(re.search(r"cardCvv|cvv|csc", " ".join(str(x.get(k, "")) for k in ("id", "name", "message")), re.I) for x in invalids or []):
+            log("[paypal] cvv invalid before submit; refill visible cvv field")
+            card = load_card(self.args.card_json)
+            self.type_field(["input[name='cvvNumber']", "#cvv", "#cardCvv", "input[aria-label='CSC']"], str(card["cvv"]), timeout=2, fast=True)
+        if any(re.search(r"dateOfBirth|birth|生年月日|date", " ".join(str(x.get(k, "")) for k in ("id", "name", "message")), re.I) for x in invalids or []):
+            log("[paypal] date of birth invalid before submit; refill visible DOB field")
+            self.type_field(["#dateOfBirth", "input[name='dateOfBirth']", "input[aria-label*='生年月日']", "input[placeholder*='生年月日']"], "19800101", timeout=2, fast=True)
         if invalids:
             time.sleep(0.2)
             diagnostics = diagnostics_state()
@@ -3181,13 +3933,62 @@ class RuyiPayPalFlow:
                 }
             )
         before = self.page_info().get("url", "")
+        submit_network_started = False
+        submit_network_seen: list[dict[str, Any]] = []
+        try:
+            if self.page:
+                submit_network_started = bool(self.page.events.start(["network.responseCompleted"], contexts=[self.page.tab_id]))
+        except Exception as exc:
+            log(f"[paypal] submit network capture disabled: {type(exc).__name__}: {exc}")
+
+        def drain_submit_network() -> None:
+            if not submit_network_started or not self.page:
+                return
+            events = getattr(self.page, "events", None)
+            if not events:
+                return
+            for _ in range(30):
+                try:
+                    event = events.wait(timeout=0.001)
+                except Exception:
+                    return
+                if not event:
+                    break
+                if getattr(event, "method", "") != "network.responseCompleted":
+                    continue
+                response = event.response if isinstance(event.response, dict) else {}
+                status = int(response.get("status") or 0)
+                url = str(response.get("url") or getattr(event, "url", "") or "")
+                if not url or "paypal.com" not in url:
+                    continue
+                record = {"status": status, "url": url[:260]}
+                submit_network_seen.append(record)
+                if re.search(r"signup|onboard|xo|graphql|api|auth|challenge|risk", url, re.I) or status >= 400:
+                    log(f"[paypal] submit network status={status} url={url[:220]}")
+
         clicked = self.click_by_text(
-            [r"agree\s*&\s*create account", r"agree and create account"],
+            [r"agree\s*&\s*create account", r"agree and create account", r"同意.*アカウント", r"同意して.*作成", r"同意して続行", r"アカウント.*作成"],
             timeout=10,
         )
         log(f"[paypal] Agree & Create Account clicked: {clicked}")
-        deadline = time.time() + 18
+        deadline = time.time() + 8
+        extended_for_otp_init = False
+        submit_captcha_checked = False
         while time.time() < deadline:
+            drain_submit_network()
+            if not submit_captcha_checked and any(
+                re.search(r"/auth/validatecaptcha|authchallenge|hostedchallenge|securitychallenge", str(item.get("url") or ""), re.I)
+                for item in submit_network_seen
+            ):
+                submit_captcha_checked = True
+                self.safe_handle_captcha_if_present(detect_wait=1)
+            if not extended_for_otp_init and any(
+                "InitiateRiskBasedTwoFactorPhoneConfirmationMutation" in str(item.get("url") or "")
+                for item in submit_network_seen
+            ):
+                extended_for_otp_init = True
+                deadline = max(deadline, time.time() + 12)
+                log("[paypal] OTP initiation API seen; waiting for verification UI")
             info = self.page_info()
             url = str(info.get("url") or "")
             text = str(info.get("text") or "")
@@ -3202,8 +4003,8 @@ class RuyiPayPalFlow:
     return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
   }
   const hasCard = visible(document.querySelector('#cardNumber, input[name="cardNumber"]'));
-  const hasCreate = [...document.querySelectorAll('button, input[type=submit], [role=button]')]
-    .some((el) => visible(el) && /Agree\\s*&\\s*Create Account|Agree and Create Account/i.test([el.innerText || el.textContent || '', el.value || '', el.getAttribute('aria-label') || ''].join(' ')));
+	  const hasCreate = [...document.querySelectorAll('button, input[type=submit], [role=button]')]
+	    .some((el) => visible(el) && /Agree\\s*&\\s*Create Account|Agree and Create Account|同意.*アカウント|アカウント.*作成|同意して.*作成|同意して続行/i.test([el.innerText || el.textContent || '', el.value || '', el.getAttribute('aria-label') || ''].join(' ')));
   return hasCard && hasCreate;
 })()
 """,
@@ -3231,9 +4032,47 @@ class RuyiPayPalFlow:
             )
             real_otp = otp_inputs or re.search(r"Enter your code|we sent|texted|sent.*code|one[- ]time code|verification code", text, re.I)
             if url != before or re.search(r"captcha|authchallenge|genericError", url + " " + text, re.I) or otp_inputs or (real_otp and not still_signup_form):
+                if submit_network_started and self.page:
+                    try:
+                        self.page.events.stop()
+                    except Exception:
+                        pass
                 return
             time.sleep(1)
-        log("[paypal] submit did not advance within 18s")
+        log("[paypal] submit did not advance within 8s")
+        drain_submit_network()
+        if submit_network_seen:
+            log(f"[paypal] submit network summary: {submit_network_seen[-12:]}")
+        auth_challenge_seen = any(
+            re.search(r"/auth/validatecaptcha|authchallenge|hostedchallenge|securitychallenge", str(item.get("url") or ""), re.I)
+            for item in submit_network_seen
+        )
+        if submit_network_started and self.page:
+            try:
+                self.page.events.stop()
+            except Exception:
+                pass
+        self.save_paypal_signup_diagnostics("paypal_signup_submit_not_advanced")
+        reason = "paypal_authchallenge_not_solved" if auth_challenge_seen else "paypal_signup_submit_not_advanced"
+        captcha_details: dict[str, Any] = {}
+        if auth_challenge_seen:
+            try:
+                captcha_details["state"] = self.captcha_state()
+            except Exception as exc:
+                captcha_details["stateError"] = f"{type(exc).__name__}: {exc}"
+            try:
+                captcha_details["params"] = self.extract_recaptcha_params()
+            except Exception as exc:
+                captcha_details["paramsError"] = f"{type(exc).__name__}: {exc}"
+        raise FlowFailed(
+            {
+                "status": "failed",
+                "reason": reason,
+                "url": self.current_url(),
+                "authChallengeSeen": auth_challenge_seen,
+                "captcha": captcha_details,
+            }
+        )
 
     def get_user_agent(self) -> str:
         try:
@@ -3358,6 +4197,8 @@ class RuyiPayPalFlow:
     f.visible &&
     /geo\.ddc\.paypal\.com\/captcha|datadome|captcha-delivery|ddc\.paypal\.com/i.test(f.src + ' ' + f.title)
   );
+  const pluginChallengeEl = document.querySelector('#captcha-standalone, .captcha-container[data-captcha-type], [data-app="authchallenge_response"]');
+  const pluginChallenge = visible(pluginChallengeEl);
   const buttonCandidates = [...document.querySelectorAll('button, input[type=submit], input[type=button], [role=button], a, div.ctp-checkbox-container, #challenge-stage')]
     .filter(visible)
     .map((el) => ({el, text: label(el)}));
@@ -3416,7 +4257,7 @@ class RuyiPayPalFlow:
     if (/invisible/i.test(src) || p.size === 'invisible') isInvisible = true;
   }
   const hasDataDomeText = /DataDome|You have been blocked|Confirm you.?re human|Try the challenge again|captcha__puzzle|captcha__audio/i.test(text);
-  const hasBlockingText = /We couldn.t load the security challenge|You have been blocked|Return to merchant|Security Challenge|Drag the slider|Move the slider|not a robot|verify you are human|confirm you.?re human|human verification/i.test(text);
+  const hasBlockingText = /We couldn.t load the security challenge|You have been blocked|Return to merchant|Security Challenge|セキュリティチェック|Drag the slider|Move the slider|not a robot|verify you are human|confirm you.?re human|human verification/i.test(text);
   const otpActionVisible = /Enter your code|verification code|one[- ]time code|we sent|texted|6[- ]digit|confirm.*phone|security code/i.test(text) ||
     visible(document.querySelector('input[name^="ciBasic-"]')) ||
     visible(document.querySelector('input[id^="ci-ciBasic-"]')) ||
@@ -3432,7 +4273,7 @@ class RuyiPayPalFlow:
     visible(document.querySelector("input[name='otc_code']")) ||
     otpActionVisible;
   const authUrl = /authchallenge|validatecaptcha|hostedchallenge|securitychallenge|verifycard/i.test(url);
-  const hasExplicitChallenge = Boolean(authUrl || slider || (challengeButton && !otpActionVisible) || (challengeFrames.length && !normalActionVisible) || datadomeFrame || hasDataDomeText);
+  const hasExplicitChallenge = Boolean(authUrl || pluginChallenge || slider || (challengeButton && !otpActionVisible) || (challengeFrames.length && !normalActionVisible) || datadomeFrame || hasDataDomeText);
   const textOnlyBlocking = hasBlockingText && !normalActionVisible;
   const detected = Boolean(hasExplicitChallenge || textOnlyBlocking);
   const datadomeParams = datadomeFrame ? paramsFromUrl(datadomeFrame.src) : {};
@@ -3459,6 +4300,7 @@ class RuyiPayPalFlow:
     isEnterprise,
     isInvisible,
     slider,
+    pluginChallenge,
     button: challengeButton ? {text: challengeButton.text, point: center(challengeButton.el)} : null,
     frame: challengeFrames[0] ? {src: challengeFrames[0].src, title: challengeFrames[0].title, point: challengeFrames[0].box} : null,
     frames: challengeFrames.map((f) => ({src: f.src, title: f.title})).slice(0, 5)
@@ -4172,6 +5014,18 @@ class RuyiPayPalFlow:
                             log("[captcha] visible challenge cleared")
                             return
                         time.sleep(1)
+                if self.is_paypal_authchallenge(state) and not self.args.enable_paypal_recaptcha_2captcha:
+                    log("[captcha] PayPal authchallenge detected; failing fast without 2Captcha")
+                    raise FlowFailed(
+                        {
+                            "status": "failed",
+                            "reason": "paypal_authchallenge_not_solved",
+                            "url": state.get("url") or self.current_url(),
+                            "text": str(state.get("text") or "")[:800],
+                            "captcha": state,
+                            "error": "PayPal reCAPTCHA Enterprise authchallenge requires a cleaner payment session/proxy; 2Captcha is disabled by default.",
+                        }
+                    )
                 log("[captcha] solving with 2Captcha")
                 api_key = self.args.captcha_api_key or os.environ.get("APIKEY_2CAPTCHA") or os.environ.get("TWOCAPTCHA_API_KEY") or ""
                 if not api_key:
@@ -4225,10 +5079,28 @@ class RuyiPayPalFlow:
             time.sleep(1)
         log("[captcha] not detected")
 
+    def is_paypal_authchallenge(self, state: dict[str, Any]) -> bool:
+        url = str(state.get("url") or self.current_url() or "")
+        frame = state.get("frame") if isinstance(state.get("frame"), dict) else {}
+        frame_src = str(frame.get("src") or "")
+        text = str(state.get("text") or "")
+        if "paypal.com" not in url and "paypalobjects.com" not in frame_src:
+            return False
+        return bool(
+            state.get("pluginChallenge")
+            or re.search(r"authchallenge|validatecaptcha|securitychallenge", url + " " + frame_src, re.I)
+            or (
+                state.get("siteKey")
+                and re.search(r"recaptcha|captcha", frame_src + " " + text, re.I)
+            )
+        )
+
     def safe_handle_captcha_if_present(self, detect_wait: int | None = None) -> bool:
         try:
             self.handle_captcha_if_present(detect_wait=detect_wait)
             return True
+        except FlowFailed:
+            raise
         except Exception as exc:
             info = {}
             try:
@@ -4393,14 +5265,43 @@ class RuyiPayPalFlow:
                 return True
             self.save_otp_fill_diagnostics("sms_code_fill_failed")
             return False
-        clicked = self.click_by_text([r"^continue$", r"confirm", r"submit", r"verify", r"next"], timeout=2)
+        clicked = self.click_by_text(
+            [
+                r"^continue$",
+                r"confirm",
+                r"submit",
+                r"verify",
+                r"next",
+                r"続行",
+                r"確認",
+                r"認証",
+                r"送信",
+                r"次へ",
+            ],
+            timeout=3,
+        )
+        if not clicked:
+            try:
+                self.page.actions.press(Keys.ENTER).perform()
+                clicked = True
+            except Exception:
+                clicked = False
         log(f"[sms] verification submitted: {clicked}")
-        deadline = time.time() + 1.2
+        deadline = time.time() + 4.0
         while time.time() < deadline:
             if already_advanced():
-                break
+                return True
             time.sleep(0.2)
-        return True
+        self.save_otp_fill_diagnostics("sms_submit_not_advanced")
+        raise FlowFailed(
+            self.annotate_result(
+                {
+                    "status": "failed",
+                    "reason": "sms_submit_not_advanced",
+                    "url": self.current_url(),
+                }
+            )
+        )
 
     def wait_manual_sms_flow(self) -> bool:
         log("[sms] manual mode; waiting for manual verification to advance")
@@ -4422,6 +5323,68 @@ class RuyiPayPalFlow:
             time.sleep(1)
         log("[sms] manual verification did not advance before timeout")
         return False
+
+    def paypal_sms_or_final_state(self) -> dict[str, Any]:
+        return self.js(
+            r"""
+(() => {
+  function visible(el) {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && !el.disabled && style.visibility !== 'hidden' && style.display !== 'none';
+  }
+  function label(el) {
+    return [el.innerText || el.textContent || '', el.value || '', el.getAttribute('aria-label') || '', el.id || '', el.name || '']
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+  const text = document.body && document.body.innerText || '';
+  const inputs = [...document.querySelectorAll('input')].filter(visible);
+  const buttons = [...document.querySelectorAll('button, input[type=submit], input[type=button], [role=button], a')]
+    .filter(visible)
+    .map(label);
+  const otpInput = inputs.some((el) => {
+    const meta = [el.id || '', el.name || '', el.placeholder || '', el.getAttribute('aria-label') || '', el.autocomplete || '', el.inputMode || ''].join(' ');
+    return /otp|code|verification|security|one[- ]time|sms|pin/i.test(meta) || Number(el.maxLength) === 1;
+  });
+  const otpText = /Enter your code|enter code|verification code|one[- ]time code|we sent|texted|sent.*code|check your phone|sms|text message|6[- ]digit|confirm.*phone|verify.*(you|identity)|security check/i.test(text);
+  return {
+    url: location.href,
+    otpVisible: Boolean(otpInput || otpText),
+    finalButton: buttons.some((x) => /Agree and Continue|Agree\s*&\s*Continue|同意して続行|同意して支払う/i.test(x)),
+    failed: /genericError|redirect_status=(failed|canceled)/i.test(location.href)
+  };
+})()
+""",
+            timeout=5,
+        ) or {}
+
+    def fail_if_sms_pending_without_code(self, sms_ok: bool) -> dict[str, Any] | None:
+        if sms_ok:
+            return None
+        try:
+            state = self.paypal_sms_or_final_state()
+        except Exception:
+            state = {}
+        otp_waiting = bool(state.get("otpVisible"))
+        if not otp_waiting:
+            try:
+                captcha_state = self.captcha_state()
+                otp_waiting = bool(captcha_state.get("otpActionVisible")) and not bool(captcha_state.get("detected"))
+            except Exception:
+                otp_waiting = False
+        if otp_waiting and not state.get("finalButton") and not state.get("failed"):
+            log("[sms] verification code unavailable while OTP page is still waiting; fail fast")
+            return self.annotate_result(
+                {
+                    "status": "failed",
+                    "reason": "sms_code_not_found",
+                    "url": state.get("url") or self.current_url(),
+                }
+            )
+        return None
 
     def save_otp_fill_diagnostics(self, reason: str) -> None:
         try:
@@ -5245,11 +6208,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-marionette", action="store_true", help="Launch without --marionette if this Firefox build crashes with it.")
     parser.add_argument("--window-size", default=os.environ.get("RUYI_WINDOW_SIZE", "1280x900"), help="Stabilized Firefox window size, e.g. 1280x900.")
     parser.add_argument("--no-stabilize-window", action="store_true", help="Do not center/resize Firefox after startup.")
-    parser.add_argument("--timezone", default="America/New_York")
+    parser.add_argument("--locale", default=os.environ.get("RUYI_LOCALE", "en-US"))
+    parser.add_argument("--timezone", default=os.environ.get("RUYI_TIMEZONE", "America/New_York"))
     parser.add_argument("--human-algorithm", default=os.environ.get("RUYI_HUMAN_ALGORITHM", "windmouse"), choices=["bezier", "windmouse"])
     parser.add_argument("--human-profile", default=os.environ.get("RUYI_HUMAN_PROFILE", "conservative"), choices=["off", "fast", "conservative"])
     parser.add_argument("--no-captcha-handling", action="store_true", help="Disable reCAPTCHA/hCaptcha/DataDome handling.")
     parser.add_argument("--enable-captcha-handling", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--enable-paypal-recaptcha-2captcha",
+        action="store_true",
+        default=os.environ.get("PAYPAL_RECAPTCHA_2CAPTCHA_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Enable 2Captcha for PayPal reCAPTCHA Enterprise authchallenge. Default fails fast because solved tokens have still returned PayPal RESTRICTED_USER in JP tests.",
+    )
     parser.add_argument(
         "--enable-datadome-2captcha",
         action="store_true",
@@ -5258,7 +6228,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--captcha-wait", default="300", help="Seconds to wait for and solve CAPTCHA.")
     parser.add_argument("--captcha-detect-wait", default="60", help="Seconds to watch for a CAPTCHA page before continuing.")
     parser.add_argument("--sms-page-wait", default="120", help="Seconds to wait for the SMS verification page.")
-    parser.add_argument("--sms-timeout", default="180")
+    parser.add_argument("--sms-timeout", default="75")
     parser.add_argument("--result-json", default="recordings/last_ruyi_paypal_result.json")
     return parser
 
@@ -5281,6 +6251,16 @@ def main() -> int:
             result = flow.run()
         except FlowFailed as exc:
             result = exc.result
+        except Exception as exc:
+            result = flow.annotate_result(
+                {
+                    "status": "failed",
+                    "reason": classify_unhandled_failure(exc),
+                    "error": str(exc),
+                    "exceptionType": type(exc).__name__,
+                    "url": flow.current_url(),
+                }
+            )
         result = flow.annotate_result(result)
         out = Path(args.result_json)
         out.parent.mkdir(parents=True, exist_ok=True)

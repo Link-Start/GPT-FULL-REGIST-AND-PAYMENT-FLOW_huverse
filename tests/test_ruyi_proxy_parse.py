@@ -10,19 +10,19 @@ from ruyi_paypal_flow import RuyiPayPalFlow, parse_proxy_url, resolve_proxy
 
 
 def test_vendor_socks_suffix_survives_resolve_proxy():
-    raw = "us2.cliproxy.io:3010:user:pass(socks)"
+    raw = "proxy.example.net:1080:user:pass(socks)"
     resolved, note = resolve_proxy(raw)
     proxy = parse_proxy_url(resolved)
 
     assert note == "explicit proxy"
     assert proxy is not None
     assert proxy["scheme"] == "socks5"
-    assert proxy["browserProxy"] == "socks5://us2.cliproxy.io:3010"
+    assert proxy["browserProxy"] == "socks5://proxy.example.net:1080"
     assert proxy["requestScheme"] == "socks5h"
 
 
 def test_vendor_socks_suffix_overrides_added_http_scheme():
-    proxy = parse_proxy_url("http://us2.cliproxy.io:3010:user:pass(socks)")
+    proxy = parse_proxy_url("http://proxy.example.net:1080:user:pass(socks)")
 
     assert proxy is not None
     assert proxy["scheme"] == "socks5"

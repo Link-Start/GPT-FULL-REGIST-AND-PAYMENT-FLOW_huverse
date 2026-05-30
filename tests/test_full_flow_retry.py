@@ -111,11 +111,11 @@ def test_build_payment_cmd_can_use_temp_proxy_override(tmp_path):
         "https://pay.openai.com/c/pay/cs_live_test",
         tmp_path / "card.json",
         tmp_path / "result.json",
-        payment_proxy="us2.cliproxy.io:3010:user:pass(socks)",
+        payment_proxy="proxy.example.net:1080:user:pass(socks)",
     )
 
     assert "--proxy" in cmd
-    assert cmd[cmd.index("--proxy") + 1] == "us2.cliproxy.io:3010:user:pass(socks)"
+    assert cmd[cmd.index("--proxy") + 1] == "proxy.example.net:1080:user:pass(socks)"
 
 
 def test_build_payment_cmd_can_use_temp_proxy_bridge(tmp_path):
@@ -137,12 +137,12 @@ def test_build_payment_cmd_can_use_temp_proxy_bridge(tmp_path):
         "https://pay.openai.com/c/pay/cs_live_test",
         tmp_path / "card.json",
         tmp_path / "result.json",
-        payment_proxy="us2.cliproxy.io:3010:user:pass(socks)",
+        payment_proxy="proxy.example.net:1080:user:pass(socks)",
         payment_proxy_chain=True,
     )
 
     assert "--proxy" not in cmd
-    assert cmd[cmd.index("--proxy-chain-upstream") + 1] == "us2.cliproxy.io:3010:user:pass(socks)"
+    assert cmd[cmd.index("--proxy-chain-upstream") + 1] == "proxy.example.net:1080:user:pass(socks)"
     assert cmd[cmd.index("--proxy-chain-via") + 1] == "direct"
 
 
@@ -165,12 +165,12 @@ def test_build_payment_cmd_can_use_primary_proxy_bridge(tmp_path):
         "https://pay.openai.com/c/pay/cs_live_test",
         tmp_path / "card.json",
         tmp_path / "result.json",
-        payment_proxy="us2.cliproxy.io:3010:user:pass(http)",
+        payment_proxy="proxy.example.net:1080:user:pass(http)",
         payment_proxy_chain=True,
     )
 
     assert "--proxy" not in cmd
-    assert cmd[cmd.index("--proxy-chain-upstream") + 1] == "us2.cliproxy.io:3010:user:pass(http)"
+    assert cmd[cmd.index("--proxy-chain-upstream") + 1] == "proxy.example.net:1080:user:pass(http)"
     assert cmd[cmd.index("--proxy-chain-via") + 1] == "direct"
 
 

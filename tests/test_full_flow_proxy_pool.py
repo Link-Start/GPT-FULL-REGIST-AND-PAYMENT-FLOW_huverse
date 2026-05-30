@@ -4,22 +4,22 @@ from full_flow_proxy_pool import ProxyPool, parse_proxy_for_curl, redact_proxy
 
 
 def test_parse_colon_socks_proxy_for_curl():
-    parsed = parse_proxy_for_curl("us2.cliproxy.io:3010:user:pass(socks)")
-    assert parsed.proxy == "socks5h://us2.cliproxy.io:3010"
+    parsed = parse_proxy_for_curl("proxy.example.net:1080:user:pass(socks)")
+    assert parsed.proxy == "socks5h://proxy.example.net:1080"
     assert parsed.user == "user:pass"
     assert parsed.scheme == "socks5h"
 
 
 def test_parse_colon_http_proxy_for_curl():
-    parsed = parse_proxy_for_curl("us2.cliproxy.io:3010:user:pass(http)")
-    assert parsed.proxy == "http://us2.cliproxy.io:3010"
+    parsed = parse_proxy_for_curl("proxy.example.net:1080:user:pass(http)")
+    assert parsed.proxy == "http://proxy.example.net:1080"
     assert parsed.user == "user:pass"
     assert parsed.scheme == "http"
 
 
 def test_parse_curl_proxy_command():
-    parsed = parse_proxy_for_curl('curl -x us2.cliproxy.io:3010 -U "user:pass" mayips.com')
-    assert parsed.proxy == "http://us2.cliproxy.io:3010"
+    parsed = parse_proxy_for_curl('curl -x proxy.example.net:1080 -U "user:pass" mayips.com')
+    assert parsed.proxy == "http://proxy.example.net:1080"
     assert parsed.user == "user:pass"
 
 

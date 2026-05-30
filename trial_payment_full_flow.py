@@ -1305,6 +1305,9 @@ def classify_payment_retry(reason_text: str, payload: dict[str, Any], rc: int) -
     for pattern in retry_patterns:
         if re.search(pattern, text, re.I):
             return True, pattern
+    payload_reason = str(payload.get("reason") or "").strip()
+    if payload_reason:
+        return False, payload_reason
     return (rc != 0 and not payload), "nonzero_without_result"
 
 
@@ -2085,6 +2088,9 @@ def main() -> int:
         "events": payment_events[-4:],
     }
     summary["status"] = "success" if payment_payload.get("status") == "success" else "payment_failed"
+    if payment_payload:
+        summary["paymentReason"] = payment_payload.get("reason") or ""
+        summary["paymentError"] = payment_payload.get("error") or ""
     if summary["status"] == "success":
         success_account_file = success_account_file_for(args, protocol_email)
         append_success_account(success_account_file, protocol_email)
