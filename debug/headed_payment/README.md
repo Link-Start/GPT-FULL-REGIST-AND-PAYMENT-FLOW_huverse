@@ -1,7 +1,8 @@
 # Headed payment debug package
 
 This package is only for payment-stage visual debugging. Normal production runs
-should keep the server default: direct + headless.
+should keep the server default: headless, with proxy/direct mode controlled by
+`full_flow.env`.
 
 ## 1. Open the local VNC tunnel
 
@@ -59,4 +60,25 @@ DISPLAY=:99 PAYMENT_HEADLESS=0 ./run_trial_payment_full_flow.sh --keep-browser-o
 ```bash
 cd /opt/openaii
 ./debug/headed_payment/server_desktop.sh stop
+```
+
+## Pull failure screenshots to local machine
+
+Headed payment failures can save screenshots on the server. Pull the latest run
+with screenshots into the local repository:
+
+```bash
+SSHPASS='your-ssh-password' ./debug/headed_payment/pull_payment_screenshots.sh latest
+```
+
+Or pull a specific run id:
+
+```bash
+SSHPASS='your-ssh-password' ./debug/headed_payment/pull_payment_screenshots.sh <run_id>
+```
+
+Local output:
+
+```text
+runtime/local_payment_screenshots/<run_id>/
 ```

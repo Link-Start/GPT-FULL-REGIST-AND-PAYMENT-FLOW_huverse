@@ -209,10 +209,12 @@ The refresh token is not printed to terminal output.
 
 ## Protocol proxy
 
-Default protocol proxy:
+Protocol registration can run direct or through a configured proxy. The public
+template defaults to direct mode so a fresh clone does not depend on a local
+proxy port:
 
 ```text
-http://127.0.0.1:7897
+GPT_TRIAL_PROXY=direct
 ```
 
 Override it when needed:
@@ -416,15 +418,20 @@ logic. It can:
 
 - start one full-flow run with manual inputs
 - start pool workers for batch mode
+- show active jobs even after a web process restart by combining in-memory jobs
+  with a lightweight process scan
 - show child runs under a parent `webq_...` queue task, including worker, run
   id, email, status, duration, payment reason, and protocol/payment log links
 - show recent `summary.json` results and log tails
 - show email/card/phone availability and active leases
 - filter/list pool rows
 - seed values into email/card/phone pools
+- generate JP/US Visa/MasterCard card lines and insert them into the card pool
 - promote retry emails back to main
 - inspect failed emails, jump to the related run logs, move them back to the
   retry pool, or delete them from the failed pool
+- batch-delete resource rows and batch-restore selected failed emails
+- expose headed/debug payment screenshots as safe artifacts
 - delete stale rows
 - add/delete proxy records
 - test proxies for registration and payment reachability
@@ -437,6 +444,7 @@ GET  /api/overview
 GET  /api/runs
 GET  /api/queue-children?runId=<webq_id>
 GET  /api/log?runId=<id>&file=payment.log
+GET  /api/artifact?runId=<id>&file=payment_result_timeout.png
 GET  /api/resource-items?kind=email&state=available&bucket=main&limit=200
 GET  /api/proxies
 POST /api/runs/start
@@ -444,14 +452,32 @@ POST /api/queue/start
 POST /api/resource-seed
 POST /api/resource-release
 POST /api/resource-delete
+POST /api/resource-delete-batch
 POST /api/promote-retry-emails
 POST /api/restore-failed-emails
+POST /api/resource-restore-emails
 POST /api/delete-failed-emails
 POST /api/resource-restore-email
+POST /api/cards/generate
 POST /api/proxies/add
 POST /api/proxies/delete
 POST /api/proxies/test
 ```
+
+### Card generator
+
+`full_flow_cardgen.py` is included in the main project and can be used from the
+Web UI or CLI. It generates Luhn-valid JP/US Visa/MasterCard test card lines in
+the same format accepted by the card pool:
+
+```bash
+python3 full_flow_cardgen.py generate --country jp --brand visa -n 5
+python3 full_flow_cardgen.py generate --country us --brand mastercard -n 5
+python3 full_flow_cardgen.py generate --country jp --brand visa -n 1 --json
+```
+
+Custom BIN is supported by the Web UI and CLI. Generated lines can be inserted
+into `card` resources without any source-code changes.
 
 Proxy test rules are intentionally fast:
 
@@ -538,6 +564,19 @@ cd /opt/openaii
 Open VNC locally at `127.0.0.1:5901`. The VNC listener stays bound to
 `127.0.0.1` on the server and is not exposed publicly.
 
+Headed/debug payment failures can save screenshots on the server. Pull them to
+the local repository with:
+
+```bash
+SSHPASS='your-ssh-password' ./debug/headed_payment/pull_payment_screenshots.sh latest
+```
+
+Local output:
+
+```text
+runtime/local_payment_screenshots/<run_id>/
+```
+
 ## Output files
 
 Each run writes:
@@ -560,7 +599,7 @@ getrt_result.json         # only when --enable-getrt and payment succeeds
 Successful account txt output contains only:
 
 ```text
-UTC_TIME<TAB>EMAIL
+EMAIL
 ```
 
 Default txt destinations are split by mailbox type:

@@ -19,10 +19,11 @@
 
 ---
 
-## 项目定位（经过修改后可用于日区Paypal，自行二次开发（本版本测试支持日本Paypal），已确认可行）（上一个版本是稳定版美区PP，现在的是不稳定日本PP，自己选择，建议回滚拿美国的自己改）
-（Paypal渠道拉闸，本注册机目前能全流程成功，但是OpenAI疑似会延迟检测PP状态，而目前的PP渠道所注册的PP会秒封，所以本项目目前已没有产号价值，可用于学习研究）
+## 项目定位
 
-`GPT-FULL-REGIST AND PAYMENT-FLOW` 是一个完整的、可部署的全流程自动化项目（全协议注册+无头支付+协议Oauth）。它把 GPT 账号协议注册、OpenAI hosted checkout 获取、Stripe/PayPal 支付、成功账号归档、可选 session-json 导出、可选 Codex OAuth getrt 导出串成一条可观测、可并发、可 Web 管理的流水线。
+`GPT-FULL-REGIST AND PAYMENT-FLOW` 是一个完整的、可直接部署运行的全流程自动化项目。仓库已经包含协议注册机、Stripe/PayPal 支付机、全流程编排器、资源池、队列并发、Web 控制台、调试工具、CardGen 测试卡生成器和可选 getrt/session-json 导出能力。
+
+使用者不需要改源码即可运行：按文档安装依赖、放置兼容的 ruyiPage 指纹 Firefox、填写自己的邮箱验证码接口、短信接口、代理和支付资源后，即可通过 CLI 或 Web UI 启动完整流程。
 
 核心目标：
 
@@ -55,9 +56,10 @@ PayPal signup / SMS OTP / final Agree
 | getrt | Codex OAuth PKCE、email OTP、可选 add-phone、CPA/sub2/codex/raw 输出 |
 | session-json | 支付成功后可选导出，默认支持 CPA 格式 |
 | 资源池 | SQLite 管理 email/card/phone，支持 retry/failed/批量操作 |
+| CardGen | Web UI 内置 JP/US Visa/MasterCard 测试卡生成，可一键入库 |
 | 并发队列 | worker 并发、目标成功数、支付浏览器 slot 控制、子任务日志聚合 |
-| Web UI | 中文控制台、单次运行、并发任务、实时日志、资源池、代理池 |
-| 有头调试 | Xvfb + x11vnc + SSH tunnel，本地可观察服务器浏览器 |
+| Web UI | 中文控制台、单次运行、并发任务、实时日志、资源池、代理池、失败截图 |
+| 有头调试 | Xvfb + x11vnc + SSH tunnel，本地可观察服务器浏览器并拉取截图 |
 
 ---
 
@@ -106,6 +108,7 @@ flowchart LR
 ├── run_full_flow_queue_worker.sh       # 并发队列入口
 ├── full_flow_pool.py                   # SQLite email/card/phone 资源池
 ├── full_flow_proxy_pool.py             # 代理池与代理测试
+├── full_flow_cardgen.py                # JP/US Visa/MasterCard 测试卡生成器
 ├── full_flow_concurrency_goal_runner.py# 并发达标测试工具
 ├── protocol/gpt_trial_protocol/        # 协议注册机
 ├── ruyipage/                           # ruyiPage + Stripe/PayPal 支付自动化
@@ -176,6 +179,8 @@ full_flow.env
 ruyipage/.env
 ```
 
+到这一步后，项目代码已经准备就绪；后续只需要在 `full_flow.env`、`ruyipage/.env` 或 Web UI 中填写自己的接口和资源，不需要修改源码。
+
 ---
 
 ## 配置说明
@@ -213,6 +218,8 @@ PAYMENT_PROXY_ENABLED=0
 PAYMENT_PROXY=proxy-host:port:user:pass(http)
 PAYMENT_PROXY_USE_BRIDGE=1
 ```
+
+公开版不会内置任何作者自用的邮箱、短信、代理或支付资源；这些都通过配置项、命令行参数或 Web UI 输入。
 
 ### `ruyipage/.env`
 
@@ -368,9 +375,11 @@ Web UI 支持：
 - 动态日志文件列表
 - 队列父任务和子任务展示
 - 邮箱/卡/手机号池管理
+- JP/US Visa/MasterCard 测试卡生成和一键入库
 - 失败邮箱查看、恢复、删除
 - 批量删除、批量转重试
 - 代理池新增、删除、注册测试、支付测试
+- 有头失败截图查看和本地拉取
 
 `webui.log` 只存在于 Web 父任务。CLI 任务或队列子任务通常只有：
 
@@ -415,6 +424,33 @@ accfile/pool/full_flow.sqlite3
 - 换卡；
 - 重新生成 PayPal signup 邮箱；
 - 不强制换手机号。
+
+### CardGen 测试卡生成
+
+Web UI 的“资源池”页内置测试卡生成器，可选择：
+
+```text
+国家：日本 JP / 美国 US
+卡组织：Visa / MasterCard
+数量：1-500
+自定义 BIN：可选
+```
+
+可以只生成到文本框，也可以直接一键写入卡池。
+
+CLI 也可以直接调用：
+
+```bash
+python3 full_flow_cardgen.py generate --country jp --brand visa -n 5
+python3 full_flow_cardgen.py generate --country us --brand mastercard -n 5
+python3 full_flow_cardgen.py generate --country jp --brand visa -n 1 --json
+```
+
+输出格式兼容资源池导入：
+
+```text
+4541 5329 0735 5291 01/30 321
+```
 
 ### 队列运行
 
@@ -610,6 +646,18 @@ SSHPASS='your-ssh-password' ./debug/headed_payment/connect_local.sh
 ./debug/headed_payment/server_desktop.sh stop
 ```
 
+有头失败时，支付机只在 headed/debug 模式下保存截图。将服务器截图拉到本地：
+
+```bash
+SSHPASS='your-ssh-password' ./debug/headed_payment/pull_payment_screenshots.sh latest
+```
+
+本地输出目录：
+
+```text
+runtime/local_payment_screenshots/<run_id>/
+```
+
 ---
 
 ## 常见问题
@@ -669,6 +717,8 @@ python3 -m py_compile \
 
 `GPT-FULL-REGIST AND PAYMENT-FLOW` is a complete automation system for GPT protocol registration, Stripe/PayPal checkout, successful-account archival, optional session-json export, and optional Codex OAuth getrt export.
 
+The repository is ready to run after configuration. You do not need to modify source code for normal usage: install dependencies, place a compatible ruyiPage fingerprint Firefox build, configure your own email-code service, SMS API, proxy exits, and payment resources, then run through CLI or the Web UI.
+
 ### Pipeline
 
 ```text
@@ -694,6 +744,7 @@ getrt                       # optional Codex OAuth refresh_token exporter
 trial_payment_full_flow.py  # orchestrator
 full_flow_web.py            # Web console
 full_flow_queue_worker.py   # queue worker
+full_flow_cardgen.py        # JP/US Visa/MasterCard card generator
 ```
 
 The modules are loosely coupled. The orchestrator connects them through CLI/subprocess contracts.
@@ -775,6 +826,22 @@ http://SERVER_IP:8765/
 
 The Web UI supports single runs, queue workers, resource pools, proxy pools, live logs, queue child runs, failed-email restore/delete, and dynamic per-run log files.
 
+It also includes a card generator for JP/US Visa/MasterCard test-card lines and can insert generated cards into the SQLite card pool.
+
+### CardGen
+
+```bash
+python3 full_flow_cardgen.py generate --country jp --brand visa -n 5
+python3 full_flow_cardgen.py generate --country us --brand mastercard -n 5
+python3 full_flow_cardgen.py generate --country jp --brand visa -n 1 --json
+```
+
+The default line format can be seeded into the card pool directly:
+
+```text
+4541 5329 0735 5291 01/30 321
+```
+
 ### Queue Mode
 
 ```bash
@@ -838,3 +905,18 @@ chatgpt.com/payments/success
 ```
 
 `User is already paid` from the protocol stage is treated as idempotent success.
+
+### Headed Debug Screenshots
+
+Payment failure screenshots are saved only for headed/debug runs. Pull them from
+the server to the local repository with:
+
+```bash
+SSHPASS='your-ssh-password' ./debug/headed_payment/pull_payment_screenshots.sh latest
+```
+
+Local output:
+
+```text
+runtime/local_payment_screenshots/<run_id>/
+```
