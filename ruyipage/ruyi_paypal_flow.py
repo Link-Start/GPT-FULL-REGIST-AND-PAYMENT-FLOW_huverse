@@ -55,6 +55,8 @@ class FlowFailed(RuntimeError):
 
 def classify_unhandled_failure(exc: BaseException) -> str:
     text = str(exc)
+    if re.search(r"Stripe amount check failed", text, re.I):
+        return "stripe_amount_check_failed"
     if re.search(r"LubanSMS getNumber failed", text, re.I):
         if re.search(r"NO_NUMBER", text, re.I):
             return "sms_provider_no_number"
@@ -1197,6 +1199,7 @@ class RuyiPayPalFlow:
         self.success_network_capture_started = False
         self.captured_success_url = ""
         self.success_network_page: Any | None = None
+        self.paypal_response_bodies: list[dict[str, Any]] = []
 
     def start(self) -> None:
         disable_local_debug_proxy_env()
@@ -1591,6 +1594,89 @@ class RuyiPayPalFlow:
                     continue
                 return ""
         return ""
+
+    def compact_network_body(self, body: Any, *, limit: int = 1800) -> dict[str, Any]:
+        if isinstance(body, bytes):
+            text = body.decode("utf-8", errors="replace")
+        else:
+            text = str(body or "")
+        # Keep diagnostics useful while avoiding raw long card/phone/token-like digits.
+        text = re.sub(
+            r"(?<!\d)\d{7,19}(?!\d)",
+            lambda m: m.group(0)[:2] + "*" * max(0, len(m.group(0)) - 4) + m.group(0)[-2:],
+            text,
+        )
+
+        def compact(value: Any, depth: int = 0) -> Any:
+            if depth >= 4:
+                return "<truncated>"
+            if isinstance(value, dict):
+                return {str(k)[:80]: compact(v, depth + 1) for k, v in list(value.items())[:40]}
+            if isinstance(value, list):
+                return [compact(v, depth + 1) for v in value[:20]]
+            if isinstance(value, str):
+                return value[:500]
+            return value
+
+        try:
+            parsed = json.loads(text)
+            return {"json": compact(parsed)}
+        except Exception:
+            return {"text": text[:limit]}
+
+    def start_paypal_response_body_capture(self, label: str) -> bool:
+        if os.environ.get("PAYPAL_CAPTURE_RESPONSE_BODIES", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            return False
+        if not self.page:
+            return False
+        try:
+            def response_handler(req: Any) -> None:
+                url = str(getattr(req, "url", "") or "")
+                status = int(getattr(req, "response_status", 0) or 0)
+                interesting = bool(
+                    "paypal.com" in url
+                    and re.search(
+                        r"graphql|payment-authentication|genericError|hostedchallenge|validatecaptcha|logclientdata",
+                        url,
+                        re.I,
+                    )
+                )
+                continued = False
+                try:
+                    req.continue_response()
+                    continued = True
+                    if not interesting:
+                        return
+                    record = {
+                        "label": label,
+                        "status": status,
+                        "url": url[:260],
+                        "body": self.compact_network_body(getattr(req, "response_body", "")),
+                    }
+                    self.paypal_response_bodies.append(record)
+                    self.paypal_response_bodies = self.paypal_response_bodies[-24:]
+                    log(f"[{label}] response body captured status={status} url={url[:180]}")
+                except Exception as exc:
+                    if not continued:
+                        try:
+                            req.continue_response()
+                        except Exception:
+                            pass
+                    log(f"[{label}] response body capture handler error: {type(exc).__name__}: {exc}")
+
+            self.page.intercept.start_responses(response_handler, collect_response=True)
+            return True
+        except Exception as exc:
+            log(f"[{label}] response body capture disabled: {type(exc).__name__}: {exc}")
+            return False
+
+    def stop_paypal_response_body_capture(self, label: str) -> None:
+        if not self.page:
+            return
+        try:
+            self.page.intercept.stop()
+        except Exception as exc:
+            log(f"[{label}] response body capture stop skipped: {type(exc).__name__}: {exc}")
 
     def start_success_network_capture(self) -> None:
         if self.success_network_capture_started or not self.page:
@@ -3259,6 +3345,15 @@ class RuyiPayPalFlow:
             )
             if result is not None:
                 return result
+        if final_state == "no_eligible_funding":
+            return self.annotate_result(
+                {
+                    "status": "failed",
+                    "reason": "paypal_no_eligible_funding",
+                    "url": self.current_url(),
+                    "text": str(self.page_info().get("text") or "")[:1200],
+                }
+            )
 
         log("[step] wait for final redirect/result")
         result = self.wait_final_result(timeout=180)
@@ -3451,8 +3546,20 @@ class RuyiPayPalFlow:
                 if time.time() < email_submit_probe_until:
                     time.sleep(0.2)
                     continue
+                if cur.get("captcha"):
+                    self.safe_handle_captcha_if_present(detect_wait=1)
                 if first_email_submit_at and time.time() - first_email_submit_at > 12:
                     self.save_paypal_signup_diagnostics("paypal_onboarding_email_stalled")
+                    if cur.get("captcha"):
+                        raise FlowFailed(
+                            self.annotate_result(
+                                {
+                                    "status": "failed",
+                                    "reason": "paypal_onboarding_authchallenge",
+                                    "url": url,
+                                }
+                            )
+                        )
                     raise RuntimeError("PayPal onboarding email did not advance after submit")
                 if time.time() - last_email_submit_at >= 3.0:
                     log("[paypal] submit onboarding email")
@@ -3937,7 +4044,12 @@ class RuyiPayPalFlow:
         submit_network_seen: list[dict[str, Any]] = []
         try:
             if self.page:
-                submit_network_started = bool(self.page.events.start(["network.responseCompleted"], contexts=[self.page.tab_id]))
+                submit_network_started = bool(
+                    self.page.events.start(
+                        ["network.beforeRequestSent", "network.responseCompleted"],
+                        contexts=[self.page.tab_id],
+                    )
+                )
         except Exception as exc:
             log(f"[paypal] submit network capture disabled: {type(exc).__name__}: {exc}")
 
@@ -3954,17 +4066,19 @@ class RuyiPayPalFlow:
                     return
                 if not event:
                     break
-                if getattr(event, "method", "") != "network.responseCompleted":
+                method = str(getattr(event, "method", "") or "")
+                if method not in {"network.beforeRequestSent", "network.responseCompleted"}:
                     continue
-                response = event.response if isinstance(event.response, dict) else {}
+                response = event.response if isinstance(getattr(event, "response", None), dict) else {}
+                request = event.request if isinstance(getattr(event, "request", None), dict) else {}
                 status = int(response.get("status") or 0)
-                url = str(response.get("url") or getattr(event, "url", "") or "")
+                url = str(response.get("url") or request.get("url") or getattr(event, "url", "") or "")
                 if not url or "paypal.com" not in url:
                     continue
-                record = {"status": status, "url": url[:260]}
+                record = {"phase": "request" if method == "network.beforeRequestSent" else "response", "status": status, "url": url[:260]}
                 submit_network_seen.append(record)
                 if re.search(r"signup|onboard|xo|graphql|api|auth|challenge|risk", url, re.I) or status >= 400:
-                    log(f"[paypal] submit network status={status} url={url[:220]}")
+                    log(f"[paypal] submit network {record['phase']} status={status} url={url[:220]}")
 
         clicked = self.click_by_text(
             [r"agree\s*&\s*create account", r"agree and create account", r"同意.*アカウント", r"同意して.*作成", r"同意して続行", r"アカウント.*作成"],
@@ -3973,15 +4087,37 @@ class RuyiPayPalFlow:
         log(f"[paypal] Agree & Create Account clicked: {clicked}")
         deadline = time.time() + 8
         extended_for_otp_init = False
-        submit_captcha_checked = False
+        auth_challenge_recoveries = 0
+        last_auth_recovery_at = 0.0
         while time.time() < deadline:
             drain_submit_network()
-            if not submit_captcha_checked and any(
+            auth_challenge_seen_now = any(
                 re.search(r"/auth/validatecaptcha|authchallenge|hostedchallenge|securitychallenge", str(item.get("url") or ""), re.I)
                 for item in submit_network_seen
+            )
+            if (
+                auth_challenge_seen_now
+                and not self.args.enable_paypal_recaptcha_2captcha
+                and auth_challenge_recoveries < 3
+                and time.time() - last_auth_recovery_at >= 1.2
             ):
-                submit_captcha_checked = True
+                auth_challenge_recoveries += 1
+                last_auth_recovery_at = time.time()
                 self.safe_handle_captcha_if_present(detect_wait=1)
+                retried = self.click_by_text(
+                    [r"agree\s*&\s*create account", r"agree and create account", r"同意.*アカウント", r"同意して.*作成", r"同意して続行", r"アカウント.*作成"],
+                    timeout=2,
+                )
+                log(f"[paypal] authchallenge DOM removed; retry signup submit attempt={auth_challenge_recoveries} clicked={retried}")
+                deadline = max(deadline, time.time() + 8.0)
+                time.sleep(0.5)
+                continue
+            if any(
+                item.get("phase") == "request"
+                and re.search(r"graphql|signup|onboard|risk|phone|identity|auth", str(item.get("url") or ""), re.I)
+                for item in submit_network_seen
+            ):
+                deadline = max(deadline, time.time() + 15)
             if not extended_for_otp_init and any(
                 "InitiateRiskBasedTwoFactorPhoneConfirmationMutation" in str(item.get("url") or "")
                 for item in submit_network_seen
@@ -4031,7 +4167,11 @@ class RuyiPayPalFlow:
                 )
             )
             real_otp = otp_inputs or re.search(r"Enter your code|we sent|texted|sent.*code|one[- ]time code|verification code", text, re.I)
-            if url != before or re.search(r"captcha|authchallenge|genericError", url + " " + text, re.I) or otp_inputs or (real_otp and not still_signup_form):
+            terminal_or_progress_url = (
+                url != before
+                and not re.search(r"authchallenge|securitychallenge|/auth/validatecaptcha", url, re.I)
+            )
+            if terminal_or_progress_url or re.search(r"genericError", url + " " + text, re.I) or otp_inputs or (real_otp and not still_signup_form):
                 if submit_network_started and self.page:
                     try:
                         self.page.events.stop()
@@ -4053,7 +4193,16 @@ class RuyiPayPalFlow:
             except Exception:
                 pass
         self.save_paypal_signup_diagnostics("paypal_signup_submit_not_advanced")
-        reason = "paypal_authchallenge_not_solved" if auth_challenge_seen else "paypal_signup_submit_not_advanced"
+        submit_requests_seen = any(
+            item.get("phase") == "request"
+            and re.search(r"graphql|signup|onboard|risk|phone|identity|auth", str(item.get("url") or ""), re.I)
+            for item in submit_network_seen
+        )
+        reason = (
+            "paypal_authchallenge_not_solved"
+            if auth_challenge_seen
+            else ("paypal_signup_submit_request_not_completed" if submit_requests_seen else "paypal_signup_submit_not_advanced")
+        )
         captcha_details: dict[str, Any] = {}
         if auth_challenge_seen:
             try:
@@ -4067,12 +4216,13 @@ class RuyiPayPalFlow:
         raise FlowFailed(
             {
                 "status": "failed",
-                "reason": reason,
-                "url": self.current_url(),
-                "authChallengeSeen": auth_challenge_seen,
-                "captcha": captcha_details,
-            }
-        )
+                    "reason": reason,
+                    "url": self.current_url(),
+                    "authChallengeSeen": auth_challenge_seen,
+                    "submitNetwork": submit_network_seen[-20:],
+                    "captcha": captcha_details,
+                }
+            )
 
     def get_user_agent(self) -> str:
         try:
@@ -4976,6 +5126,64 @@ class RuyiPayPalFlow:
         log(f"[captcha] token injected: {result}")
         return True
 
+    def remove_paypal_recaptcha_dom(self, state: dict[str, Any] | None = None) -> dict[str, Any]:
+        result = self.js(
+            """
+(() => {
+  function visible(el) {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  }
+  const targets = new Set();
+  const selectors = [
+    'iframe[src*="recaptcha"]',
+    'iframe[src*="captcha"][src*="paypalobjects.com"]',
+    '#captcha-standalone',
+    '[data-app="authchallenge_response"]',
+    '.captcha-container',
+    '.captcha-overlay',
+    '.recaptcha-container',
+    '[id*="recaptcha" i]',
+    '[class*="recaptcha" i]'
+  ];
+  for (const selector of selectors) {
+    for (const el of document.querySelectorAll(selector)) targets.add(el);
+  }
+  for (const frame of document.querySelectorAll('iframe')) {
+    const src = frame.src || '';
+    if (!/recaptcha|paypalobjects\\.com\\/.*captcha/i.test(src)) continue;
+    targets.add(frame);
+    const container = frame.closest('#captcha-standalone,[data-app="authchallenge_response"],.captcha-container,.recaptcha-container,.captcha-overlay');
+    if (container) targets.add(container);
+  }
+  const removed = [];
+  for (const el of [...targets]) {
+    if (!el || !el.parentNode) continue;
+    removed.push({
+      tag: (el.tagName || '').toLowerCase(),
+      id: el.id || '',
+      cls: String(el.className || '').slice(0, 120),
+      visible: visible(el)
+    });
+    el.remove();
+  }
+  for (const el of document.querySelectorAll('textarea[name*="recaptcha" i], input[name*="recaptcha" i], textarea[name="g-recaptcha-response"], input[name="g-recaptcha-response"]')) {
+    if (!el.parentNode) continue;
+    removed.push({tag: (el.tagName || '').toLowerCase(), id: el.id || '', name: el.name || '', hiddenField: true});
+    el.remove();
+  }
+  return {removedCount: removed.length, removed: removed.slice(0, 20), url: location.href};
+})()
+""",
+            timeout=5,
+        )
+        if not isinstance(result, dict):
+            result = {"raw": result}
+        log(f"[captcha] PayPal reCAPTCHA DOM removed: {result}")
+        return result
+
     def handle_captcha_if_present(self, detect_wait: int | None = None) -> None:
         if self.args.no_captcha_handling:
             return
@@ -5015,17 +5223,8 @@ class RuyiPayPalFlow:
                             return
                         time.sleep(1)
                 if self.is_paypal_authchallenge(state) and not self.args.enable_paypal_recaptcha_2captcha:
-                    log("[captcha] PayPal authchallenge detected; failing fast without 2Captcha")
-                    raise FlowFailed(
-                        {
-                            "status": "failed",
-                            "reason": "paypal_authchallenge_not_solved",
-                            "url": state.get("url") or self.current_url(),
-                            "text": str(state.get("text") or "")[:800],
-                            "captcha": state,
-                            "error": "PayPal reCAPTCHA Enterprise authchallenge requires a cleaner payment session/proxy; 2Captcha is disabled by default.",
-                        }
-                    )
+                    self.remove_paypal_recaptcha_dom(state)
+                    return
                 log("[captcha] solving with 2Captcha")
                 api_key = self.args.captcha_api_key or os.environ.get("APIKEY_2CAPTCHA") or os.environ.get("TWOCAPTCHA_API_KEY") or ""
                 if not api_key:
@@ -5135,7 +5334,7 @@ class RuyiPayPalFlow:
   const text = document.body && document.body.innerText || '';
   const signupForm = visible(document.querySelector('#cardNumber, input[name="cardNumber"]')) &&
     [...document.querySelectorAll('button, input[type=submit], [role=button]')]
-      .some((el) => visible(el) && /Agree\\s*&\\s*Create Account|Agree and Create Account/i.test([el.innerText || el.textContent || '', el.value || '', el.getAttribute('aria-label') || ''].join(' ')));
+      .some((el) => visible(el) && /Agree\\s*&\\s*Create Account|Agree and Create Account|同意.*アカウント|アカウント.*作成|同意して.*作成|同意して続行/i.test([el.innerText || el.textContent || '', el.value || '', el.getAttribute('aria-label') || ''].join(' ')));
   const otpText = /Enter your code|enter code|verification code|one[- ]time code|we sent|texted|sent.*code|check your phone|sms|text message|6[- ]digit|confirm.*phone|verify.*(you|identity)|security check/i.test(text);
   const codeSelectors = [
     'input[name^="ciBasic-"]',
@@ -5165,12 +5364,14 @@ class RuyiPayPalFlow:
   const params = new URLSearchParams(location.search);
   const hasTerminalReason = params.has('reason') &&
     !/paypal\.com\/webapps\/hermes|billingweb\/review|billingLite=1/i.test(location.href);
+  const rawFinalButton = buttons.some((x) => /Agree and Continue|Agree\\s*&\\s*Continue|同意して続行|同意して支払う|同意する|支払う/i.test(x));
   return {
     url: location.href,
     text: text.slice(0, 1200),
     signupForm,
     otpVisible: Boolean(codeInput || passwordOtp || (!signupForm && (otpText || genericInput))),
-    finalButton: buttons.some((x) => /Agree and Continue|Agree\\s*&\\s*Continue/i.test(x)),
+    invalidCode: Boolean((codeInput || otpText) && /コードを確認して、?再度お試しください|コードが正しくありません|確認コードが違います|invalid\\s+code|incorrect\\s+code|wrong\\s+code|try\\s+again/i.test(text)),
+    finalButton: Boolean(rawFinalButton && !signupForm && !codeInput && !passwordOtp && !genericInput),
     failed: /genericError|redirect_status=(failed|canceled)/i.test(location.href) || hasTerminalReason
   };
 })()
@@ -5249,10 +5450,10 @@ class RuyiPayPalFlow:
         verify_deadline = time.time() + 8
         while time.time() < verify_deadline:
             state = sms_state()
-            if state.get("failed") or state.get("finalButton"):
-                return bool(state.get("finalButton"))
             if state.get("otpVisible"):
                 break
+            if state.get("failed") or state.get("finalButton"):
+                return bool(state.get("finalButton"))
             time.sleep(0.5)
         _announce_sms_code(self, code)
         filled = self.fill_sms_code(code)
@@ -5265,21 +5466,64 @@ class RuyiPayPalFlow:
                 return True
             self.save_otp_fill_diagnostics("sms_code_fill_failed")
             return False
-        clicked = self.click_by_text(
-            [
-                r"^continue$",
-                r"confirm",
-                r"submit",
-                r"verify",
-                r"next",
-                r"続行",
-                r"確認",
-                r"認証",
-                r"送信",
-                r"次へ",
-            ],
-            timeout=3,
-        )
+        sms_submit_network_started = False
+        sms_submit_network_seen: list[dict[str, Any]] = []
+        sms_body_capture_started = self.start_paypal_response_body_capture("sms-body")
+        try:
+            if self.page:
+                sms_submit_network_started = bool(
+                    self.page.events.start(
+                        ["network.beforeRequestSent", "network.responseCompleted"],
+                        contexts=[self.page.tab_id],
+                    )
+                )
+        except Exception as exc:
+            log(f"[sms] submit network capture disabled: {type(exc).__name__}: {exc}")
+
+        def drain_sms_submit_network() -> None:
+            if not sms_submit_network_started or not self.page:
+                return
+            events = getattr(self.page, "events", None)
+            if not events:
+                return
+            for _ in range(30):
+                try:
+                    event = events.wait(timeout=0.001)
+                except Exception:
+                    return
+                if not event:
+                    break
+                method = str(getattr(event, "method", "") or "")
+                if method not in {"network.beforeRequestSent", "network.responseCompleted"}:
+                    continue
+                response = event.response if isinstance(getattr(event, "response", None), dict) else {}
+                request = event.request if isinstance(getattr(event, "request", None), dict) else {}
+                status = int(response.get("status") or 0)
+                url = str(response.get("url") or request.get("url") or getattr(event, "url", "") or "")
+                if not url or "paypal.com" not in url:
+                    continue
+                record = {"phase": "request" if method == "network.beforeRequestSent" else "response", "status": status, "url": url[:260]}
+                sms_submit_network_seen.append(record)
+                if re.search(r"graphql|phone|confirm|otp|code|risk|auth|challenge", url, re.I) or status >= 400:
+                    log(f"[sms] submit network {record['phase']} status={status} url={url[:220]}")
+
+        clicked = self.click_sms_submit_button()
+        if not clicked:
+            clicked = self.click_by_text(
+                [
+                    r"^continue$",
+                    r"confirm",
+                    r"submit",
+                    r"verify",
+                    r"next",
+                    r"続行",
+                    r"確認",
+                    r"認証",
+                    r"送信",
+                    r"次へ",
+                ],
+                timeout=3,
+            )
         if not clicked:
             try:
                 self.page.actions.press(Keys.ENTER).perform()
@@ -5288,17 +5532,134 @@ class RuyiPayPalFlow:
                 clicked = False
         log(f"[sms] verification submitted: {clicked}")
         deadline = time.time() + 4.0
+        post_sms_authchallenge_seen = False
+        progress_seen = 0
+        invalid_code_retried = False
         while time.time() < deadline:
+            before_count = len(sms_submit_network_seen)
+            drain_sms_submit_network()
+            new_records = sms_submit_network_seen[before_count:]
+            try:
+                state = sms_state()
+            except Exception:
+                state = {}
+            if state.get("invalidCode"):
+                if invalid_code_retried:
+                    self.save_otp_fill_diagnostics(
+                        "sms_code_invalid",
+                        extra={
+                            "smsSubmitNetwork": sms_submit_network_seen[-20:],
+                            "paypalResponseBodies": self.paypal_response_bodies[-12:],
+                        },
+                    )
+                    raise FlowFailed(
+                        self.annotate_result(
+                            {
+                                "status": "failed",
+                                "reason": "sms_code_invalid",
+                                "url": self.current_url(),
+                                "smsSubmitNetwork": sms_submit_network_seen[-20:],
+                                "paypalResponseBodies": self.paypal_response_bodies[-12:],
+                            }
+                        )
+                    )
+                invalid_code_retried = True
+                log("[sms] PayPal reported invalid OTP; refilling code once")
+                try:
+                    fetched, _signature, _raw = fetch_sms_code(sms_api)
+                    if fetched:
+                        code = fetched
+                        _announce_sms_code(self, code)
+                except Exception as exc:
+                    log(f"[sms] failed to refresh OTP before retry: {type(exc).__name__}: {exc}")
+                if not self.fill_sms_code(code):
+                    self.save_otp_fill_diagnostics("sms_code_refill_failed")
+                    raise FlowFailed(
+                        self.annotate_result(
+                            {
+                                "status": "failed",
+                                "reason": "sms_code_refill_failed",
+                                "url": self.current_url(),
+                                "smsSubmitNetwork": sms_submit_network_seen[-20:],
+                            }
+                        )
+                    )
+                clicked = self.click_sms_submit_button()
+                if not clicked:
+                    clicked = self.click_by_text([r"続行", r"確認", r"認証", r"送信", r"continue", r"confirm", r"verify"], timeout=2)
+                log(f"[sms] verification resubmitted after invalid OTP: {clicked}")
+                deadline = time.time() + 8.0
+                time.sleep(0.3)
+                continue
+            if not post_sms_authchallenge_seen and any(
+                re.search(r"authchallenge|hostedchallenge|securitychallenge|/auth/validatecaptcha", str(item.get("url") or ""), re.I)
+                for item in sms_submit_network_seen
+            ):
+                post_sms_authchallenge_seen = True
+                log("[sms] PayPal authchallenge appeared after OTP submit")
+                self.safe_handle_captcha_if_present(detect_wait=1)
+                deadline = min(deadline, time.time() + 2.0)
+            if new_records and any(
+                re.search(r"graphql|phone|confirm|otp|code|risk|auth|threeds", str(item.get("url") or ""), re.I)
+                for item in new_records
+            ):
+                if not post_sms_authchallenge_seen:
+                    progress_seen += 1
+                    deadline = max(deadline, time.time() + 8.0)
+                    if progress_seen <= 3:
+                        log("[sms] PayPal backend progress after OTP; extending advance wait")
             if already_advanced():
+                if sms_submit_network_started and self.page:
+                    try:
+                        self.page.events.stop()
+                    except Exception:
+                        pass
+                if sms_body_capture_started:
+                    self.stop_paypal_response_body_capture("sms-body")
                 return True
             time.sleep(0.2)
-        self.save_otp_fill_diagnostics("sms_submit_not_advanced")
+        drain_sms_submit_network()
+        if sms_submit_network_started and self.page:
+            try:
+                self.page.events.stop()
+            except Exception:
+                pass
+        if sms_body_capture_started:
+            self.stop_paypal_response_body_capture("sms-body")
+        if post_sms_authchallenge_seen:
+            self.save_otp_fill_diagnostics(
+                "paypal_authchallenge_after_sms",
+                extra={
+                    "smsSubmitNetwork": sms_submit_network_seen[-20:],
+                    "paypalResponseBodies": self.paypal_response_bodies[-12:],
+                },
+            )
+            raise FlowFailed(
+                self.annotate_result(
+                    {
+                        "status": "failed",
+                        "reason": "paypal_authchallenge_after_sms",
+                        "url": self.current_url(),
+                        "smsSubmitNetwork": sms_submit_network_seen[-20:],
+                        "paypalResponseBodies": self.paypal_response_bodies[-12:],
+                    }
+                )
+            )
+        self.save_otp_fill_diagnostics(
+            "sms_submit_not_advanced",
+            extra={
+                "smsSubmitNetwork": sms_submit_network_seen[-20:],
+                "paypalResponseBodies": self.paypal_response_bodies[-12:],
+            },
+        )
         raise FlowFailed(
             self.annotate_result(
                 {
                     "status": "failed",
                     "reason": "sms_submit_not_advanced",
                     "url": self.current_url(),
+                    "smsSubmitNetwork": sms_submit_network_seen[-20:],
+                    "paypalResponseBodies": self.paypal_response_bodies[-12:],
                 }
             )
         )
@@ -5345,15 +5706,18 @@ class RuyiPayPalFlow:
   const buttons = [...document.querySelectorAll('button, input[type=submit], input[type=button], [role=button], a')]
     .filter(visible)
     .map(label);
+  const signupForm = visible(document.querySelector('#cardNumber, input[name="cardNumber"]')) &&
+    buttons.some((x) => /Agree\s*&\s*Create Account|Agree and Create Account|同意.*アカウント|アカウント.*作成|同意して.*作成|同意して続行/i.test(x));
   const otpInput = inputs.some((el) => {
     const meta = [el.id || '', el.name || '', el.placeholder || '', el.getAttribute('aria-label') || '', el.autocomplete || '', el.inputMode || ''].join(' ');
     return /otp|code|verification|security|one[- ]time|sms|pin/i.test(meta) || Number(el.maxLength) === 1;
   });
   const otpText = /Enter your code|enter code|verification code|one[- ]time code|we sent|texted|sent.*code|check your phone|sms|text message|6[- ]digit|confirm.*phone|verify.*(you|identity)|security check/i.test(text);
+  const rawFinalButton = buttons.some((x) => /Agree and Continue|Agree\s*&\s*Continue|同意して続行|同意して支払う|同意する|支払う/i.test(x));
   return {
     url: location.href,
     otpVisible: Boolean(otpInput || otpText),
-    finalButton: buttons.some((x) => /Agree and Continue|Agree\s*&\s*Continue|同意して続行|同意して支払う/i.test(x)),
+    finalButton: Boolean(rawFinalButton && !signupForm && !(otpInput || otpText)),
     failed: /genericError|redirect_status=(failed|canceled)/i.test(location.href)
   };
 })()
@@ -5386,7 +5750,59 @@ class RuyiPayPalFlow:
             )
         return None
 
-    def save_otp_fill_diagnostics(self, reason: str) -> None:
+    def click_sms_submit_button(self) -> bool:
+        point = self.js(
+            r"""
+(() => {
+  function visible(el) {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && !el.disabled && style.visibility !== 'hidden' && style.display !== 'none';
+  }
+  function text(el) {
+    return [el.innerText || el.textContent || '', el.value || '', el.getAttribute('aria-label') || '', el.id || '', el.name || '']
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+  const inputs = [...document.querySelectorAll(
+    'input[name^="ciBasic-"], input[id^="ci-ciBasic-"], input[autocomplete="one-time-code"], input[name*="code" i], input[id*="code" i], input[maxlength="6"], input[maxlength="1"]'
+  )].filter(visible);
+  if (!inputs.length) return false;
+  const inputRect = inputs.reduce((best, el) => {
+    const r = el.getBoundingClientRect();
+    if (!best || r.top > best.top) return r;
+    return best;
+  }, null);
+  const root = inputs[0].closest('[role="dialog"], [aria-modal="true"], form, [class*="modal"], [class*="dialog"]') || document;
+  const candidates = [...root.querySelectorAll('button, input[type=submit], input[type=button], [role=button], a')]
+    .filter(visible)
+    .map((el) => {
+      const r = el.getBoundingClientRect();
+      return {el, r, label: text(el)};
+    })
+    .filter((x) => /continue|confirm|submit|verify|next|続行|確認|認証|送信|次へ/i.test(x.label));
+  if (!candidates.length) return false;
+  const below = candidates
+    .filter((x) => !inputRect || x.r.top >= inputRect.bottom - 8)
+    .sort((a, b) => a.r.top - b.r.top || a.r.left - b.r.left);
+  const picked = below[0] || candidates[0];
+  picked.el.scrollIntoView({block:'center', inline:'center'});
+  const r2 = picked.el.getBoundingClientRect();
+  return {x: r2.left + r2.width / 2, y: r2.top + r2.height / 2, text: picked.label};
+})()
+""",
+            timeout=3,
+        )
+        if isinstance(point, dict) and point.get("x") is not None and point.get("y") is not None:
+            log(f"[sms] submit button near OTP: {point.get('text')}")
+            self.click_point(point)
+            time.sleep(random.uniform(0.15, 0.35))
+            return True
+        return False
+
+    def save_otp_fill_diagnostics(self, reason: str, extra: dict[str, Any] | None = None) -> None:
         try:
             out = Path(self.args.result_json).with_name(f"{Path(self.args.result_json).stem}_{reason}.json")
             diag = self.js(
@@ -5438,6 +5854,8 @@ class RuyiPayPalFlow:
 """,
                 timeout=3,
             ) or {}
+            if extra:
+                diag.update(extra)
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps({"reason": reason, "diagnostic": diag}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             log(f"[sms] OTP fill diagnostic saved: {out}")
@@ -5733,7 +6151,7 @@ class RuyiPayPalFlow:
                 click_attempts += 1
                 advanced = False
                 after_url = url
-                for _ in range(8):
+                for _ in range(20):
                     time.sleep(0.15)
                     if self.drain_success_network_events():
                         advanced = True
@@ -5755,6 +6173,11 @@ class RuyiPayPalFlow:
                     self.final_confirmation_state = "clicked_unaccepted" if clicked else "not_clicked"
                     return self.final_confirmation_state
                 continue
+            if state.get("noEligibleFunding"):
+                log("[paypal] Hermes review has no eligible funding source and no consent button")
+                self.save_final_confirmation_diagnostics("paypal_no_eligible_funding")
+                self.final_confirmation_state = "no_eligible_funding"
+                return "no_eligible_funding"
             time.sleep(0.5)
         log("[paypal] final confirmation button not detected")
         self.save_final_confirmation_diagnostics("final_confirmation_not_detected")
@@ -5782,7 +6205,22 @@ class RuyiPayPalFlow:
                 ),
             }
         )
+        if self.paypal_response_bodies:
+            result.setdefault("paypalResponseBodies", self.paypal_response_bodies[-12:])
         return result
+
+    def save_result_screenshot(self, result: dict[str, Any]) -> None:
+        if not self.page:
+            return
+        try:
+            result_path = Path(str(self.args.result_json or "recordings/last_ruyi_paypal_result.json"))
+            reason = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(result.get("reason") or result.get("status") or "result")).strip("_")
+            screenshot_path = result_path.with_name(f"{result_path.stem}_{reason or 'result'}.png")
+            self.page.screenshot(str(screenshot_path))
+            result["screenshotPath"] = str(screenshot_path)
+            log(f"[screenshot] saved {screenshot_path}")
+        except Exception as exc:
+            log(f"[screenshot] save failed: {type(exc).__name__}: {exc}")
 
     def save_final_confirmation_diagnostics(self, reason: str) -> None:
         try:
@@ -5814,19 +6252,22 @@ class RuyiPayPalFlow:
     .filter(visible)
     .map(label);
   const inputs = [...document.querySelectorAll('input')].filter(visible);
+  const text = document.body && document.body.innerText || '';
   const emailInput = inputs.some((el) => /email|login_email/i.test([el.id || '', el.name || '', el.placeholder || '', el.getAttribute('aria-label') || ''].join(' ')));
   const otp = visible(document.querySelector('#otc_code')) ||
     visible(document.querySelector("input[name='otc_code']")) ||
     visible(document.querySelector("input[autocomplete='one-time-code']")) ||
     visible(document.querySelector("input[name^='ciBasic-']")) ||
     visible(document.querySelector("input[id^='ci-ciBasic-']"));
-  const finalButton = buttons.some((x) => /Agree and Continue|Agree\\s*&\\s*Continue|consentButton/i.test(x));
+  const finalButton = buttons.some((x) => /Agree and Continue|Agree\\s*&\\s*Continue|consentButton|同意して続行|同意して支払う|同意する|支払う/i.test(x));
+  const noEligibleFunding = /対象となるカードが登録されていません|新しい支払方法を追加してください|No eligible funding|add a new payment method|Add a bank or card/i.test(text);
   const createAccount = buttons.some((x) => /Create\\s+(an?\\s+)?Account/i.test(x));
   const passkey = buttons.some((x) => /Log in with Passkey/i.test(x));
   const next = buttons.some((x) => /^Next$/i.test(x));
   return {
     url: location.href,
     finalButton,
+    noEligibleFunding,
     loginFallback: emailInput && (createAccount || passkey || next),
     captcha: /authchallenge|captcha|robot|Security Challenge/i.test(location.href + ' ' + buttons.join(' ')),
     otp,
@@ -5864,7 +6305,7 @@ class RuyiPayPalFlow:
   }
   const controls = [...document.querySelectorAll('button, input[type=submit], input[type=button], [role=button], a')]
     .filter(visible);
-  const el = controls.find((x) => /Agree and Continue|Agree\\s*&\\s*Continue/i.test(label(x)));
+  const el = controls.find((x) => /Agree and Continue|Agree\\s*&\\s*Continue|同意して続行|同意して支払う|同意する|支払う/i.test(label(x)));
   if (!el) return false;
   el.scrollIntoView({block:'center', inline:'center'});
   const r = el.getBoundingClientRect();
@@ -5918,7 +6359,7 @@ class RuyiPayPalFlow:
   }
   const controls = [...document.querySelectorAll('#consentButton, [data-testid="consentButton"], button[name="consentButton"], button, input[type=submit], input[type=button], [role=button], a')]
     .filter(visible);
-  const el = controls.find((x) => /consentButton|Agree and Continue|Agree\\s*&\\s*Continue/i.test(label(x)));
+  const el = controls.find((x) => /consentButton|Agree and Continue|Agree\\s*&\\s*Continue|同意して続行|同意して支払う|同意する|支払う/i.test(label(x)));
   if (!el) return false;
   el.scrollIntoView({block:'center', inline:'center'});
   el.click();
@@ -6012,10 +6453,22 @@ class RuyiPayPalFlow:
             return {"status": "success", "reason": "stripe_returned_from_redirect", "url": url, "title": title, "text": text[:800]}
         if redirect_status in {"failed", "canceled"}:
             return {"status": "failed", "reason": f"stripe_redirect_{redirect_status}", "url": url, "title": title, "text": text[:800]}
+        if "paypal.com/checkoutweb/genericError" in url:
+            paypal_code = self.decode_query_base64(url, "code")
+            if paypal_code:
+                normalized = re.sub(r"[^a-z0-9]+", "_", paypal_code.lower()).strip("_")
+                return {
+                    "status": "failed",
+                    "reason": f"paypal_{normalized}" if normalized else "paypal_generic_error",
+                    "paypalErrorCode": paypal_code,
+                    "url": url,
+                    "title": title,
+                    "text": text[:800],
+                }
+            return {"status": "failed", "reason": "paypal_generic_error", "url": url, "title": title, "text": text[:800]}
         if any(
             marker in url
             for marker in (
-                "paypal.com/checkoutweb/genericError",
                 "paypal.com/myaccount/transfer/homepage",
                 "paypal.com/restricted",
                 "paypal.com/hostedchallenge",
@@ -6153,13 +6606,16 @@ class RuyiPayPalFlow:
         return None
 
     def decode_reason(self, url: str) -> str:
+        return self.decode_query_base64(url, "reason")
+
+    def decode_query_base64(self, url: str, key: str) -> str:
         try:
             query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-            raw = (query.get("reason") or [""])[0]
+            raw = (query.get(key) or [""])[0]
             if not raw:
                 return ""
             padded = raw + "=" * (-len(raw) % 4)
-            return base64.b64decode(padded).decode("utf-8", errors="replace")
+            return base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
         except Exception:
             return ""
 
@@ -6262,6 +6718,8 @@ def main() -> int:
                 }
             )
         result = flow.annotate_result(result)
+        if result.get("status") != "success" and not args.headless:
+            flow.save_result_screenshot(result)
         out = Path(args.result_json)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

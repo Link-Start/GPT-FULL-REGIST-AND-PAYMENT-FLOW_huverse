@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from full_flow_cardgen import card_lines, generate_cards
 from full_flow_pool import FullFlowPool, PoolItem
 from full_flow_proxy_pool import ProxyPool, redact_proxy
 
@@ -64,10 +65,10 @@ HTML = r"""<!doctype html>
         <form class="card" id="runForm">
           <h2>启动全流程</h2>
           <div class="row"><label>邮箱</label><input name="email" autocomplete="off" placeholder="name@icloud.com"></div>
-          <div class="split"><div class="row"><label>邮箱类型</label><select name="emailType"><option>auto</option><option>icloud</option><option>custom</option></select></div><div class="row"><label>验证码来源</label><select name="emailCodeProvider"><option>auto</option><option>extract_json</option><option>openai_code_json</option></select></div></div>
+          <div class="split"><div class="row"><label>邮箱类型</label><select name="emailType"><option>icloud</option><option>frimail</option><option>auto</option></select></div><div class="row"><label>验证码来源</label><select name="emailCodeProvider"><option>auto</option><option>extract_json</option><option>openai_code_json</option></select></div></div>
           <div class="row"><label>卡信息</label><input name="cardLine" autocomplete="off" placeholder="CARD MM/YY CVV"></div>
           <div class="row"><label>支付接码</label><input name="smsLine" autocomplete="off" placeholder="+1xxxx----https://sms-api"></div>
-          <div class="split"><div class="row"><label>支付代理模式</label><select name="paymentMode"><option value="auto_temp">直连，t=bv 后用代理</option><option value="direct">只用直连</option><option value="force_proxy">支付开始就用代理</option></select></div><div class="row"><label>代理 ID</label><input name="paymentProxyId" type="number" min="0" placeholder="可选"></div></div>
+          <div class="split"><div class="row"><label>支付代理模式</label><select name="paymentMode"><option value="auto_temp">使用配置默认（当前 JP 支付代理）</option><option value="direct">只用直连</option><option value="force_proxy">支付开始就用代理</option></select></div><div class="row"><label>代理 ID</label><input name="paymentProxyId" type="number" min="0" placeholder="可选"></div></div>
           <div class="split"><div class="row"><label>并发数</label><input name="workers" type="number" min="1" max="12" value="1"></div><div class="row"><label>目标成功数</label><input name="successTarget" type="number" min="0" max="999" placeholder="空=不按成功数补跑"></div></div>
           <div class="split"><div class="row"><label>最大任务数</label><input name="maxRuns" type="number" min="0" max="999" placeholder="空=跑到池空"></div><div class="row"><label>补跑策略</label><input value="失败不计入目标成功数" disabled></div></div>
           <div class="split"><div class="row"><label>支付槽位</label><input name="paymentBrowserSlots" type="number" min="0" max="6" placeholder="默认配置，0=不限制"></div><div class="row"><label>说明</label><input value="协议并发，支付按槽位并发" disabled></div></div>
@@ -108,6 +109,10 @@ HTML = r"""<!doctype html>
           <button class="btn" id="showFailedBtn">查看失败邮箱</button>
           <button class="btn gold" id="restoreSelectedPoolBtn">选中转重试</button>
           <button class="btn red" id="deleteSelectedPoolBtn">删除选中</button>
+          <h2 style="margin-top:18px">生成测试卡</h2>
+          <div class="split"><div class="row"><label>国家</label><select id="cardGenCountry"><option value="jp">日本 JP</option><option value="us">美国 US</option></select></div><div class="row"><label>卡组织</label><select id="cardGenBrand"><option value="visa">Visa</option><option value="mastercard">MasterCard</option></select></div></div>
+          <div class="split"><div class="row"><label>数量</label><input id="cardGenCount" type="number" min="1" max="500" value="5"></div><div class="row"><label>自定义 BIN</label><input id="cardGenBin" autocomplete="off" placeholder="可选，例如 454153"></div></div>
+          <div class="actions"><button class="btn" id="generateCardsBtn">生成到文本框</button><button class="btn gold" id="generateCardsSeedBtn">生成并入库</button></div>
         </aside>
         <section class="card"><h2>资源列表</h2><div class="table"><table><thead><tr><th><input id="selectAllPool" type="checkbox" aria-label="全选资源"></th><th>ID</th><th>类型</th><th>值</th><th>状态</th><th>分组</th><th>使用</th><th>最近原因</th><th>关联任务</th><th>操作</th></tr></thead><tbody id="poolRows"></tbody></table></div></section>
       </div>
@@ -136,12 +141,13 @@ HTML = r"""<!doctype html>
     function formData(form){return Object.fromEntries(new FormData(form).entries())}
     function activePage(){const tab=document.querySelector(".tab.active");return tab?tab.dataset.page:"run"}
     async function overview(all=false){const d=await api("/api/overview");$("dbPath").textContent=d.db;$("stats").innerHTML=[stat("活跃任务",d.activeJobs,"个任务"),stat("邮箱",d.pool.emails_main,"主池"),stat("预备邮箱",d.pool.emails_retry,"重试池"),stat("失败邮箱",d.pool.emails_failed,"待处理"),stat("卡",d.pool.cards_available,"可用"),stat("手机",d.pool.phones_available,"可用"),stat("支付代理",d.proxy.proxies_payment_ok,"可用"),stat("注册代理",d.proxy.proxies_protocol_ok,"可用")].join("");const page=activePage();if(all||page==="run")await loadRuns();if(all||page==="pool")await loadPool();if(all||page==="proxy")await loadProxies()}
-    async function loadRuns(){const d=await api("/api/runs");$("runRows").innerHTML=(d.runs||[]).map(r=>{const disabled=String(r.status)==="running"?"disabled":"";const webBtn=r.hasWebLog?`<button class="btn small" onclick="showRun('${esc(r.runId)}','webui.log')">Web日志</button>`:"";return `<tr><td><input class="run-check" type="checkbox" value="${esc(r.runId)}" ${disabled}></td><td><code>${esc(r.runId)}</code></td><td>${badge(r.status)}</td><td><code>${esc(r.seconds||"")}</code></td><td>${esc(r.paymentReason||"")}</td><td><div class="actions"><button class="btn small" onclick="showRun('${esc(r.runId)}','summary.json')">汇总</button><button class="btn small" onclick="showRun('${esc(r.runId)}','payment.log')">支付日志</button>${webBtn}<button class="btn red small" onclick="deleteRuns(['${esc(r.runId)}'])" ${disabled}>删除</button></div></td></tr>`}).join("")||`<tr><td colspan="6">暂无任务</td></tr>`;$("selectAllRuns").checked=false}
+    function paymentCell(r){const parts=[];if(r.paymentReason)parts.push(`<div>${esc(r.paymentReason)}</div>`);if(r.paymentError)parts.push(`<small style="color:var(--muted)">${esc(r.paymentError)}</small>`);if(r.screenshotFile)parts.push(`<div><button class="btn small" onclick="openArtifact('${esc(r.runId)}','${esc(r.screenshotFile)}')">截图</button></div>`);return parts.join("")||""}
+    async function loadRuns(){const d=await api("/api/runs");$("runRows").innerHTML=(d.runs||[]).map(r=>{const disabled=String(r.status)==="running"?"disabled":"";const webBtn=r.hasWebLog?`<button class="btn small" onclick="showRun('${esc(r.runId)}','webui.log')">Web日志</button>`:"";return `<tr><td><input class="run-check" type="checkbox" value="${esc(r.runId)}" ${disabled}></td><td><code>${esc(r.runId)}</code></td><td>${badge(r.status)}</td><td><code>${esc(r.seconds||"")}</code></td><td>${paymentCell(r)}</td><td><div class="actions"><button class="btn small" onclick="showRun('${esc(r.runId)}','summary.json')">汇总</button><button class="btn small" onclick="showRun('${esc(r.runId)}','payment.log')">支付日志</button>${webBtn}<button class="btn red small" onclick="deleteRuns(['${esc(r.runId)}'])" ${disabled}>删除</button></div></td></tr>`}).join("")||`<tr><td colspan="6">暂无任务</td></tr>`;$("selectAllRuns").checked=false}
     async function loadLogFiles(runId,preferred=""){if(!runId)return"";const d=await api(`/api/log-files?runId=${encodeURIComponent(runId)}`);const files=(d.files&&d.files.length?d.files:["summary.json"]);const current=preferred||$("logFile").value||files[0];$("logFile").innerHTML=files.map(f=>`<option value="${esc(f)}">${esc(f)}</option>`).join("");$("logFile").value=files.includes(current)?current:files[0];return $("logFile").value}
     async function showRun(runId,file){selectedRun=runId;lastLogKey="";lastLogText="";document.querySelector('[data-page="jobs"]').click();await loadLogFiles(runId,file);await loadQueueChildren();await loadLog(true)}
     async function loadLog(force=false){if(!selectedRun||logLoading)return;const file=$("logFile").value||await loadLogFiles(selectedRun);const key=`${selectedRun}:${file}`;const box=$("logBox");const wasNearBottom=box.scrollTop+box.clientHeight>=box.scrollHeight-24;if(force||key!==lastLogKey)box.textContent="加载中...";logLoading=true;try{const d=await api(`/api/log?runId=${encodeURIComponent(selectedRun)}&file=${encodeURIComponent(file)}`);const text=d.text||"";if(force||key!==lastLogKey||text!==lastLogText){box.textContent=text;lastLogKey=key;lastLogText=text;if(wasNearBottom||force)box.scrollTop=box.scrollHeight}}catch(e){if(force)box.textContent=e.message||String(e)}finally{logLoading=false}}
     async function autoRefreshLog(){if(!selectedRun)return;if(!document.getElementById("page-jobs").classList.contains("active"))return;await loadLogFiles(selectedRun,$("logFile").value);await loadQueueChildren();await loadLog(false)}
-    async function loadQueueChildren(){if(!selectedRun)return;try{const d=await api(`/api/queue-children?runId=${encodeURIComponent(selectedRun)}`);const children=d.children||[];if(!children.length){$("childRunsWrap").classList.add("hide");$("childRunRows").innerHTML="";return}$("childRunsWrap").classList.remove("hide");$("childRunRows").innerHTML=children.map(c=>`<tr><td><code>${esc(c.worker||"")}</code></td><td><code>${esc(c.runId)}</code></td><td>${esc(c.email||"")}</td><td>${badge(c.status)}</td><td><code>${esc(c.seconds||"")}</code></td><td>${esc(c.paymentReason||"")}</td><td><div class="actions"><button class="btn small" onclick="showRun('${esc(c.runId)}','summary.json')">汇总</button><button class="btn small" onclick="showRun('${esc(c.runId)}','protocol.log')">协议</button><button class="btn small" onclick="showRun('${esc(c.runId)}','payment.log')">支付</button></div></td></tr>`).join("")}catch(e){$("childRunsWrap").classList.add("hide")}}
+    async function loadQueueChildren(){if(!selectedRun)return;try{const d=await api(`/api/queue-children?runId=${encodeURIComponent(selectedRun)}`);const children=d.children||[];if(!children.length){$("childRunsWrap").classList.add("hide");$("childRunRows").innerHTML="";return}$("childRunsWrap").classList.remove("hide");$("childRunRows").innerHTML=children.map(c=>`<tr><td><code>${esc(c.worker||"")}</code></td><td><code>${esc(c.runId)}</code></td><td>${esc(c.email||"")}</td><td>${badge(c.status)}</td><td><code>${esc(c.seconds||"")}</code></td><td>${paymentCell(c)}</td><td><div class="actions"><button class="btn small" onclick="showRun('${esc(c.runId)}','summary.json')">汇总</button><button class="btn small" onclick="showRun('${esc(c.runId)}','protocol.log')">协议</button><button class="btn small" onclick="showRun('${esc(c.runId)}','payment.log')">支付</button></div></td></tr>`).join("")}catch(e){$("childRunsWrap").classList.add("hide")}}
     async function startRun(queue=false){const f=$("runForm");const body=formData(f);body.sessionJson=f.querySelector('[name="sessionJson"]').checked;body.getrt=f.querySelector('[name="getrt"]').checked;body.getrtAddPhone=f.querySelector('[name="getrtAddPhone"]').checked;body.usePool=f.querySelector('[name="usePool"]').checked;body.queue=queue;try{const d=await api(queue?"/api/queue/start":"/api/runs/start",{method:"POST",body:JSON.stringify(body)});setStatus(`已启动 ${d.runId}`);selectedRun=d.runId;await overview(true);await showRun(d.runId,"webui.log")}catch(e){setStatus(e.message,true)}}
     async function loadPool(){const q=new URLSearchParams({kind:$("poolKind").value,state:$("poolState").value,bucket:$("poolKind").value==="email"?$("poolBucket").value:"",limit:"300"});const d=await api(`/api/resource-items?${q}`);$("poolRows").innerHTML=(d.items||[]).map(i=>{const actions=[];const logActions=[];if(i.kind==="email"&&i.lastRunId){logActions.push(`<button class="btn small" onclick="showRun('${esc(i.lastRunId)}','summary.json')">汇总</button>`);logActions.push(`<button class="btn small" onclick="showRun('${esc(i.lastRunId)}','protocol.log')">协议</button>`);logActions.push(`<button class="btn small" onclick="showRun('${esc(i.lastRunId)}','payment.log')">支付</button>`)}if(i.kind==="email"&&(i.state==="failed"||i.bucket==="failed"))actions.push(`<button class="btn small" onclick="restoreEmail(${i.id},'retry')">转重试</button>`);if(i.kind==="email"&&i.bucket==="retry"&&i.state==="available")actions.push(`<button class="btn small" onclick="restoreEmail(${i.id},'main')">回主池</button>`);if(i.state==="leased")actions.push(`<button class="btn small" onclick="releasePool('${i.kind}',${i.id})">释放</button>`);actions.push(`<button class="btn red small" onclick="deletePool('${i.kind}',${i.id})">删除</button>`);return `<tr><td><input class="pool-check" type="checkbox" value="${i.id}" data-kind="${esc(i.kind)}" data-state="${esc(i.state)}" data-bucket="${esc(i.bucket||"")}"></td><td><code>${i.id}</code></td><td>${esc(i.kind)}</td><td><code>${esc(i.value)}</code></td><td>${badge(i.state)}</td><td>${esc(bucketName(i.bucket))}</td><td><code>${esc(i.kind==="email"?`${i.attempts||0}/${i.retryCount||0}`:i.useCount||0)}</code></td><td>${esc(i.lastReason||"")}</td><td><code>${esc(i.lastRunId||"")}</code><div class="actions">${logActions.join("")}</div></td><td><div class="actions">${actions.join("")}</div></td></tr>`}).join("")||`<tr><td colspan="10">暂无资源</td></tr>`;$("selectAllPool").checked=false}
     async function seedPool(){await api("/api/resource-seed",{method:"POST",body:JSON.stringify({kind:$("poolKind").value,values:$("poolValues").value})});$("poolValues").value="";await overview()}
@@ -156,16 +162,18 @@ HTML = r"""<!doctype html>
     async function restoreSelectedPool(){const items=selectedPoolItems().filter(i=>i.kind==="email");if(!items.length)return setStatus("未选择邮箱资源",true);if(!confirm(`确认将选中的 ${items.length} 个邮箱转入重试池？`))return;const d=await api("/api/resource-restore-emails",{method:"POST",body:JSON.stringify({ids:items.map(i=>i.id),bucket:"retry"})});setStatus(`已转入重试池 ${d.restored||0} 个邮箱`);await overview()}
     async function deleteSelectedPool(){const items=selectedPoolItems();if(!items.length)return setStatus("未选择资源",true);if(!confirm(`确认删除选中的 ${items.length} 个资源？`))return;const d=await api("/api/resource-delete-batch",{method:"POST",body:JSON.stringify({items})});setStatus(`已删除 ${d.deleted||0} 个资源${d.skipped&&d.skipped.length?`，跳过 ${d.skipped.length} 个`:``}`);await overview()}
     function showFailedEmails(){$("poolKind").value="email";$("poolState").value="failed";$("poolBucket").value="failed";loadPool()}
+    async function generateCards(insert=false){const body={country:$("cardGenCountry").value,brand:$("cardGenBrand").value,count:$("cardGenCount").value,bin:$("cardGenBin").value,insert};const d=await api("/api/cards/generate",{method:"POST",body:JSON.stringify(body)});$("poolKind").value="card";$("poolValues").value=(d.lines||[]).join("\n");setStatus(insert?`已生成并入库 ${d.inserted||0} 张卡`:`已生成 ${d.lines.length} 张卡到文本框`);await overview()}
     async function loadProxies(){const d=await api("/api/proxies");$("proxyRows").innerHTML=(d.items||[]).map(p=>`<tr><td><code>${p.id}</code></td><td><code>${esc(p.redacted)}</code></td><td>${p.protocolOk?badge("ok"):badge("new")} <code>${p.protocolLatencyMs||""}</code></td><td>${p.paymentOk?badge("ok"):badge("new")} <code>${p.paymentLatencyMs||""}</code></td><td>${esc([p.ip,p.country,p.timezone].filter(Boolean).join(" / "))}</td><td>${esc(p.lastError||"")}</td><td><div class="actions"><button class="btn small" onclick="testProxy(${p.id},'protocol')">测注册</button><button class="btn small" onclick="testProxy(${p.id},'payment')">测支付</button><button class="btn red small" onclick="deleteProxy(${p.id})">删除</button></div></td></tr>`).join("")||`<tr><td colspan="7">暂无代理</td></tr>`}
     async function addProxy(){await api("/api/proxies/add",{method:"POST",body:JSON.stringify({values:$("proxyValues").value})});$("proxyValues").value="";await overview()}
     async function testProxy(id,role){setStatus(`正在测试代理 #${id} ${role}`);try{await api("/api/proxies/test",{method:"POST",body:JSON.stringify({id,role})});setStatus("代理测试完成");await overview()}catch(e){setStatus(e.message,true);await loadProxies()}}
     async function deleteProxy(id){if(!confirm("确认删除该代理？"))return;await api("/api/proxies/delete",{method:"POST",body:JSON.stringify({id})});await overview()}
     async function deleteRuns(runIds){const ids=(runIds||selectedRunIds()).filter(Boolean);if(!ids.length)return setStatus("未选择任务",true);if(!confirm(`确认删除 ${ids.length} 个历史任务？`))return;try{const d=await api("/api/runs/delete",{method:"POST",body:JSON.stringify({runIds:ids})});setStatus(`已删除 ${d.deleted.length} 个任务${d.skipped.length?`，跳过 ${d.skipped.length} 个`:``}`);if(ids.includes(selectedRun)){$("logBox").textContent="请选择一个任务。";selectedRun="";lastLogKey="";lastLogText=""}await overview()}catch(e){setStatus(e.message,true)}}
+    function openArtifact(runId,file){window.open(`/api/artifact?runId=${encodeURIComponent(runId)}&file=${encodeURIComponent(file)}`,"_blank")}
     function selectedRunIds(){return Array.from(document.querySelectorAll(".run-check:checked")).map(x=>x.value)}
     function toggleRunChecks(checked){document.querySelectorAll(".run-check:not(:disabled)").forEach(x=>x.checked=checked)}
     document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>{document.querySelectorAll(".tab,.page").forEach(x=>x.classList.remove("active"));b.classList.add("active");$(`page-${b.dataset.page}`).classList.add("active");overview()});
-    $("runForm").onsubmit=e=>{e.preventDefault();startRun(false)};$("queueBtn").onclick=()=>startRun(true);$("refreshLogBtn").onclick=()=>loadLog(true);$("logFile").onchange=()=>{lastLogKey="";lastLogText="";loadLog(true)};$("seedPoolBtn").onclick=seedPool;$("promoteBtn").onclick=promote;$("restoreFailedBtn").onclick=restoreFailed;$("deleteFailedBtn").onclick=deleteFailedEmails;$("showFailedBtn").onclick=showFailedEmails;$("restoreSelectedPoolBtn").onclick=restoreSelectedPool;$("deleteSelectedPoolBtn").onclick=deleteSelectedPool;$("addProxyBtn").onclick=addProxy;$("deleteRunsBtn").onclick=()=>deleteRuns();$("selectAllRuns").onchange=e=>toggleRunChecks(e.target.checked);$("selectAllPool").onchange=e=>togglePoolChecks(e.target.checked);$("poolKind").onchange=()=>{if($("poolKind").value!=="email")$("poolBucket").value="";loadPool()};$("poolState").onchange=loadPool;$("poolBucket").onchange=loadPool;
-    window.showRun=showRun;window.releasePool=releasePool;window.restoreEmail=restoreEmail;window.deletePool=deletePool;window.testProxy=testProxy;window.deleteProxy=deleteProxy;window.deleteRuns=deleteRuns;overview(true);setInterval(()=>overview(false),8000);setInterval(autoRefreshLog,1500);
+    $("runForm").onsubmit=e=>{e.preventDefault();startRun(false)};$("queueBtn").onclick=()=>startRun(true);$("refreshLogBtn").onclick=()=>loadLog(true);$("logFile").onchange=()=>{lastLogKey="";lastLogText="";loadLog(true)};$("seedPoolBtn").onclick=seedPool;$("promoteBtn").onclick=promote;$("restoreFailedBtn").onclick=restoreFailed;$("deleteFailedBtn").onclick=deleteFailedEmails;$("showFailedBtn").onclick=showFailedEmails;$("restoreSelectedPoolBtn").onclick=restoreSelectedPool;$("deleteSelectedPoolBtn").onclick=deleteSelectedPool;$("generateCardsBtn").onclick=()=>generateCards(false);$("generateCardsSeedBtn").onclick=()=>generateCards(true);$("addProxyBtn").onclick=addProxy;$("deleteRunsBtn").onclick=()=>deleteRuns();$("selectAllRuns").onchange=e=>toggleRunChecks(e.target.checked);$("selectAllPool").onchange=e=>togglePoolChecks(e.target.checked);$("poolKind").onchange=()=>{if($("poolKind").value!=="email")$("poolBucket").value="";loadPool()};$("poolState").onchange=loadPool;$("poolBucket").onchange=loadPool;
+    window.showRun=showRun;window.releasePool=releasePool;window.restoreEmail=restoreEmail;window.deletePool=deletePool;window.testProxy=testProxy;window.deleteProxy=deleteProxy;window.deleteRuns=deleteRuns;window.openArtifact=openArtifact;overview(true);setInterval(()=>overview(false),8000);setInterval(autoRefreshLog,1500);
   </script>
 </body>
 </html>"""
@@ -181,7 +189,7 @@ class ActiveJob:
     proc: subprocess.Popen[str]
 
 
-def load_env_file(path: Path, env: dict[str, str]) -> None:
+def load_env_file(path: Path, env: dict[str, str], *, override: bool = False) -> None:
     if not path.exists():
         return
     for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -191,7 +199,11 @@ def load_env_file(path: Path, env: dict[str, str]) -> None:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip("'\"")
-        if key:
+        if not key:
+            continue
+        if override:
+            env[key] = value
+        else:
             env.setdefault(key, value)
 
 
@@ -271,6 +283,10 @@ class FlowWebHandler(BaseHTTPRequestHandler):
                 run_id = self._query(query, "runId", "")
                 self._send_json({"ok": True, "files": self._available_run_files(run_id)})
                 return
+            if parsed.path == "/api/artifact":
+                query = parse_qs(parsed.query)
+                self._send_artifact(self._query(query, "runId", ""), self._query(query, "file", ""))
+                return
             if parsed.path == "/api/resource-items":
                 query = parse_qs(parsed.query)
                 items = self.pool.list_items(
@@ -317,6 +333,11 @@ class FlowWebHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/resource-seed":
                 inserted = self.pool.seed_values(str(body.get("kind") or ""), self._values(body.get("values")))
                 self._send_json({"ok": True, "inserted": inserted, "stats": self.pool.stats()})
+                return
+            if parsed.path == "/api/cards/generate":
+                lines = self._generate_card_lines(body)
+                inserted = self.pool.seed_values("card", lines) if body.get("insert") else 0
+                self._send_json({"ok": True, "lines": lines, "inserted": inserted, "stats": self.pool.stats()})
                 return
             if parsed.path == "/api/seed":
                 inserted = self.pool.seed_values(str(body.get("kind") or ""), self._values(body.get("values")))
@@ -404,7 +425,7 @@ class FlowWebHandler(BaseHTTPRequestHandler):
         out_dir.mkdir(parents=True, exist_ok=True)
         log_path = out_dir / "webui.log"
         env = os.environ.copy()
-        load_env_file(ROOT / "full_flow.env", env)
+        load_env_file(ROOT / "full_flow.env", env, override=True)
         log_file = log_path.open("a", encoding="utf-8")
         log_file.write(f"[web] started {datetime.now(timezone.utc).isoformat()}\n")
         log_file.write("[web] cmd " + " ".join(self._redact_cmd(cmd)) + "\n")
@@ -419,9 +440,11 @@ class FlowWebHandler(BaseHTTPRequestHandler):
         cmd = [sys.executable, str(MAIN_SCRIPT), "--run-id", run_id]
         use_pool = bool(body.get("usePool"))
         if use_pool:
-            self._require_pool_ready()
+            self._require_pool_ready(min_phones=0 if str(body.get("smsLine") or "").strip() else 1)
             cmd.extend(["--pool-db", str(self.pool.path), "--pool-worker-id", f"web-{run_id}"])
             cmd.extend(["--pool-max-email-retries", str(getattr(self.server, "max_email_retries", 3))])  # type: ignore[attr-defined]
+            if str(body.get("smsLine") or "").strip():
+                cmd.extend(["--sms-line", str(body.get("smsLine")).strip()])
         else:
             self._append_required(cmd, "--email", body.get("email"), "email")
             self._append_required(cmd, "--card-line", body.get("cardLine"), "card line")
@@ -433,10 +456,11 @@ class FlowWebHandler(BaseHTTPRequestHandler):
         workers = max(1, min(12, self._int(body.get("workers"), 1)))
         max_runs = self._int(body.get("maxRuns"), 0)
         success_target = self._int(body.get("successTarget"), 0)
+        has_sms_line = bool(str(body.get("smsLine") or "").strip())
         self._require_pool_ready(
             min_emails=success_target if success_target > 0 else 1,
             min_cards=success_target if success_target > 0 else 1,
-            min_phones=min(workers, success_target) if success_target > 0 else 1,
+            min_phones=0 if has_sms_line else (min(workers, success_target) if success_target > 0 else 1),
         )
         cmd = [sys.executable, str(QUEUE_SCRIPT), "--pool-db", str(self.pool.path), "--workers", str(workers), "--worker-prefix", f"{run_id}_"]
         if max_runs > 0:
@@ -445,6 +469,8 @@ class FlowWebHandler(BaseHTTPRequestHandler):
             cmd.extend(["--success-target", str(success_target)])
             cmd.extend(["--payment-retries", "0"])
         cmd.extend(["--pool-max-email-retries", str(getattr(self.server, "max_email_retries", 3))])  # type: ignore[attr-defined]
+        if has_sms_line:
+            cmd.extend(["--sms-line", str(body.get("smsLine")).strip()])
         self._append_common_flow_args(cmd, body)
         return cmd
 
@@ -458,10 +484,23 @@ class FlowWebHandler(BaseHTTPRequestHandler):
             missing.append(f"邮箱 {emails}/{max(1, min_emails)}")
         if cards < max(1, min_cards):
             missing.append(f"卡 {cards}/{max(1, min_cards)}")
-        if phones < max(1, min_phones):
-            missing.append(f"手机号 {phones}/{max(1, min_phones)}")
+        if min_phones > 0 and phones < min_phones:
+            missing.append(f"手机号 {phones}/{min_phones}")
         if missing:
             raise ValueError("资源池不足，请先补充：" + "、".join(missing))
+
+    def _generate_card_lines(self, body: dict[str, Any]) -> list[str]:
+        count = max(1, min(500, self._int(body.get("count"), 1)))
+        seed_value = str(body.get("seed") or "").strip()
+        seed = self._int(seed_value, 0) if seed_value else None
+        cards = generate_cards(
+            str(body.get("country") or "jp"),
+            str(body.get("brand") or "visa"),
+            count=count,
+            bin_prefix=str(body.get("bin") or body.get("binPrefix") or "").strip(),
+            seed=seed,
+        )
+        return card_lines(cards)
 
     def _append_common_flow_args(self, cmd: list[str], body: dict[str, Any]) -> None:
         cmd.extend(["--email-type", str(body.get("emailType") or "icloud")])
@@ -509,11 +548,32 @@ class FlowWebHandler(BaseHTTPRequestHandler):
         if summary_path.exists():
             return
         is_queue = any(Path(item).name == QUEUE_SCRIPT.name for item in job.cmd)
+        reason = "queue worker finished; see child runs" if is_queue else "orchestrator exited before writing summary.json"
+        queue_stats: dict[str, int] = {}
+        if is_queue:
+            for line in reversed(read_text_tail(job.log_path, 20000).splitlines()):
+                if not line.startswith("[queue] finished "):
+                    continue
+                for part in line.split()[2:]:
+                    if "=" not in part:
+                        continue
+                    key, value = part.split("=", 1)
+                    try:
+                        queue_stats[key] = int(value)
+                    except ValueError:
+                        pass
+                if queue_stats:
+                    reason = (
+                        f"queue worker finished; started={queue_stats.get('started', 0)} "
+                        f"success={queue_stats.get('success', 0)} target={queue_stats.get('target', 0)}"
+                    )
+                break
         summary = {
             "runId": job.run_id,
             "status": ("queue_failed" if rc else "queue_finished") if is_queue else ("launcher_failed" if rc else "finished_without_summary"),
             "returnCode": rc,
-            "reason": "queue worker finished; see child runs" if is_queue else "orchestrator exited before writing summary.json",
+            "reason": reason,
+            "queue": queue_stats,
             "webLog": str(job.log_path),
             "startedAt": datetime.fromtimestamp(job.started_at, timezone.utc).isoformat(),
             "finishedAt": datetime.now(timezone.utc).isoformat(),
@@ -583,6 +643,7 @@ class FlowWebHandler(BaseHTTPRequestHandler):
     def _runs(self) -> list[dict[str, Any]]:
         active = self._active_jobs()
         rows: list[dict[str, Any]] = []
+        process_run_ids = self._running_process_run_ids()
         for run_id, job in list(active.items()):
             rc = job.proc.poll()
             if rc is not None:
@@ -598,19 +659,33 @@ class FlowWebHandler(BaseHTTPRequestHandler):
                     "_mtime": time.time(),
                 }
             )
+            process_run_ids.pop(run_id, None)
+        for run_id, started_at in process_run_ids.items():
+            if not self._safe_run_id(run_id):
+                continue
+            rows.append(
+                {
+                    "runId": run_id,
+                    "status": "running",
+                    "seconds": round(max(0.0, time.time() - started_at), 1) if started_at else "",
+                    "paymentReason": "detected running process",
+                    "hasWebLog": (Path(getattr(self.server, "runtime_dir")) / run_id / "webui.log").exists(),  # type: ignore[arg-type]
+                    "_mtime": time.time(),
+                }
+            )
         runtime_dir = Path(getattr(self.server, "runtime_dir"))  # type: ignore[arg-type]
         for summary_path in sorted(runtime_dir.glob("*/summary.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:40]:
             try:
                 data = json.loads(summary_path.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            result = data.get("payment", {}).get("result", {}) if isinstance(data.get("payment"), dict) else {}
+            details = self._payment_run_details(data, summary_path.parent)
             rows.append(
                 {
                     "runId": str(data.get("runId") or summary_path.parent.name),
                     "status": str(data.get("status") or ""),
                     "seconds": data.get("seconds", ""),
-                    "paymentReason": str(result.get("reason") or ""),
+                    **details,
                     "hasWebLog": (summary_path.parent / "webui.log").exists(),
                     "_mtime": summary_path.stat().st_mtime,
                 }
@@ -633,19 +708,44 @@ class FlowWebHandler(BaseHTTPRequestHandler):
         text = read_text_tail(webui_path, 8000)
         rc = ""
         reason = ""
+        queue_finished = False
+        queue_failed = False
         for line in reversed(text.splitlines()):
+            if not queue_finished and line.startswith("[queue] finished "):
+                queue_finished = True
+                queue_stats: dict[str, int] = {}
+                for part in line.split()[2:]:
+                    if "=" not in part:
+                        continue
+                    key, value = part.split("=", 1)
+                    try:
+                        queue_stats[key] = int(value)
+                    except ValueError:
+                        pass
+                success = queue_stats.get("success", 0)
+                target = queue_stats.get("target", 0)
+                started = queue_stats.get("started", 0)
+                reason = f"queue worker finished; started={started} success={success} target={target}"
+                queue_failed = bool(target > 0 and success < target)
             if not reason and "error:" in line:
                 reason = line.split("error:", 1)[1].strip()
             if line.startswith("[web] finished rc="):
                 rc = line.split("rc=", 1)[1].split()[0]
             if rc and reason:
                 break
-        status = "running" if not rc else ("finished_without_summary" if rc == "0" else "launcher_failed")
+        if rc:
+            status = "finished_without_summary" if rc == "0" else "launcher_failed"
+        elif queue_finished:
+            status = "queue_failed" if queue_failed else "queue_finished"
+        else:
+            status = "running"
         return {
             "runId": webui_path.parent.name,
             "status": status,
             "seconds": "",
             "paymentReason": reason,
+            "paymentError": "",
+            "screenshotFile": "",
             "hasWebLog": True,
             "_mtime": webui_path.stat().st_mtime,
         }
@@ -704,6 +804,8 @@ class FlowWebHandler(BaseHTTPRequestHandler):
                 "seconds": "",
                 "email": "",
                 "paymentReason": "",
+                "paymentError": "",
+                "screenshotFile": "",
                 "returnCode": children[child_id].get("returnCode", ""),
                 "hasWebLog": (runtime_dir / child_id / "webui.log").exists(),
             }
@@ -718,13 +820,47 @@ class FlowWebHandler(BaseHTTPRequestHandler):
                             "status": str(data.get("status") or row["status"]),
                             "seconds": data.get("seconds", ""),
                             "email": str(data.get("successEmail") or protocol.get("email") or ""),
-                            "paymentReason": str(result.get("reason") or data.get("reason") or ""),
+                            **self._payment_run_details(data, summary_path.parent),
                         }
                     )
                 except Exception:
                     pass
             rows.append(row)
         return rows
+
+    def _payment_run_details(self, data: dict[str, Any], run_dir: Path) -> dict[str, str]:
+        payment = data.get("payment", {}) if isinstance(data.get("payment"), dict) else {}
+        result = payment.get("result", {}) if isinstance(payment.get("result"), dict) else {}
+        reason = str(result.get("reason") or data.get("paymentReason") or data.get("reason") or "")
+        error = str(
+            result.get("error")
+            or result.get("paymentError")
+            or data.get("paymentError")
+            or result.get("paypalErrorCode")
+            or ""
+        )
+        return {
+            "paymentReason": reason,
+            "paymentError": error[:240],
+            "screenshotFile": self._screenshot_file(result, run_dir),
+        }
+
+    def _screenshot_file(self, result: dict[str, Any], run_dir: Path) -> str:
+        value = str(result.get("screenshotPath") or "").strip()
+        if not value:
+            return ""
+        path = Path(value)
+        if not path.is_absolute():
+            path = run_dir / path
+        try:
+            resolved = path.resolve()
+            if run_dir.resolve() not in resolved.parents:
+                return ""
+            if not resolved.exists() or resolved.suffix.lower() != ".png":
+                return ""
+            return resolved.name
+        except Exception:
+            return ""
 
     def _kv(self, line: str, key: str) -> str:
         prefix = key + "="
@@ -739,13 +875,70 @@ class FlowWebHandler(BaseHTTPRequestHandler):
 
     def _active_job_count(self) -> int:
         active = self._active_jobs()
-        count = 0
+        run_ids: set[str] = set(self._running_process_run_ids().keys())
         for run_id, job in list(active.items()):
             if job.proc.poll() is None:
-                count += 1
+                run_ids.add(run_id)
             else:
                 active.pop(run_id, None)
-        return count
+        return len(run_ids)
+
+    def _running_process_run_ids(self) -> dict[str, float]:
+        proc_root = Path("/proc")
+        if not proc_root.exists():
+            return {}
+        own_pid = os.getpid()
+        runtime_dir = Path(getattr(self.server, "runtime_dir")).resolve()  # type: ignore[arg-type]
+        found: dict[str, float] = {}
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid == own_pid:
+                continue
+            try:
+                raw = (entry / "cmdline").read_bytes()
+            except Exception:
+                continue
+            if not raw:
+                continue
+            parts = [item.decode("utf-8", errors="ignore") for item in raw.split(b"\0") if item]
+            joined = " ".join(parts)
+            if not any(name in joined for name in (MAIN_SCRIPT.name, QUEUE_SCRIPT.name, "ruyi_paypal_flow.py")):
+                continue
+            run_id = self._run_id_from_cmd(parts, runtime_dir)
+            if not self._safe_run_id(run_id):
+                continue
+            started = 0.0
+            try:
+                stat_fields = (entry / "stat").read_text(encoding="utf-8", errors="ignore").split()
+                ticks = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+                boot_time = 0.0
+                for line in Path("/proc/stat").read_text(encoding="utf-8", errors="ignore").splitlines():
+                    if line.startswith("btime "):
+                        boot_time = float(line.split()[1])
+                        break
+                if len(stat_fields) > 21 and boot_time:
+                    started = boot_time + (float(stat_fields[21]) / float(ticks))
+            except Exception:
+                started = 0.0
+            found.setdefault(run_id, started)
+        return found
+
+    def _run_id_from_cmd(self, parts: list[str], runtime_dir: Path) -> str:
+        for index, item in enumerate(parts[:-1]):
+            if item == "--run-id":
+                return parts[index + 1]
+            if item == "--worker-prefix":
+                return parts[index + 1].rstrip("_")
+            if item == "--result-json":
+                try:
+                    path = Path(parts[index + 1]).resolve()
+                    if runtime_dir in path.parents:
+                        return path.parent.name
+                except Exception:
+                    pass
+        return ""
 
     def _read_run_file(self, run_id: str, file_name: str) -> str:
         if not run_id:
@@ -858,6 +1051,27 @@ class FlowWebHandler(BaseHTTPRequestHandler):
         payload = html.encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("content-type", "text/html; charset=utf-8")
+        self.send_header("content-length", str(len(payload)))
+        self.send_header("cache-control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send_artifact(self, run_id: str, file_name: str) -> None:
+        if not self._safe_run_id(run_id):
+            self._send_error("invalid runId", HTTPStatus.BAD_REQUEST)
+            return
+        safe_name = Path(file_name).name
+        if not safe_name or Path(safe_name).suffix.lower() != ".png":
+            self._send_error("invalid artifact", HTTPStatus.BAD_REQUEST)
+            return
+        runtime_dir = Path(getattr(self.server, "runtime_dir")).resolve()  # type: ignore[arg-type]
+        path = (runtime_dir / run_id / safe_name).resolve()
+        if runtime_dir not in path.parents or not path.exists():
+            self._send_error("artifact not found", HTTPStatus.NOT_FOUND)
+            return
+        payload = path.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("content-type", "image/png")
         self.send_header("content-length", str(len(payload)))
         self.send_header("cache-control", "no-store")
         self.end_headers()
